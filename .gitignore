@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# WhatsApp session (KEEP PRIVATE)
+.whatsapp-session/
+.whatsapp-session-new/
+.wwebjs_cache/
+sent_whatsapp.json
+live_news.json
+send_queue.json
+whatsapp_log.json
+
+# Cache and config
+cache/
+whatsapp_config.json
+selfhosted_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
