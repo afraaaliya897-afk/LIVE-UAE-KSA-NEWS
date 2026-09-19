@@ -142,7 +142,7 @@ python alerter_selfhosted.py --watch
 ### `selfhosted_config.json`
 ```json
 {
-  "groupId": "120363430703422570@g.us",  # Your WhatsApp group ID
+  "groupId": "YOUR_GROUP_ID@g.us",
   "botApiUrl": "http://localhost:3000"   # Local bot API
 }
 ```
