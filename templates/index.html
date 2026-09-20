@@ -375,10 +375,26 @@
     font-weight: 600; cursor: pointer;
   }
   .ghost-btn:hover { background: var(--surface-2); }
-  .countdown {
-    font-size: 12.5px; font-weight: 700; color: var(--brand);
-    background: var(--brand-soft); border-radius: 999px; padding: 6px 10px;
+  .auto-toggle {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+    font-size: 12.5px; font-weight: 700; color: var(--muted);
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 6px 12px 6px 6px; user-select: none;
   }
+  .auto-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    position: relative; width: 34px; height: 20px; border-radius: 999px;
+    background: var(--border); flex: none; transition: background 0.15s;
+  }
+  .toggle-thumb {
+    position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgba(16,24,40,0.25);
+    transition: transform 0.15s;
+  }
+  .auto-toggle input:checked + .toggle-track { background: #25D366; }
+  .auto-toggle input:checked + .toggle-track .toggle-thumb { transform: translateX(14px); }
+  .auto-toggle input:disabled + .toggle-track { opacity: 0.6; }
+  .auto-toggle input:focus-visible + .toggle-track { box-shadow: 0 0 0 3px var(--brand-soft); }
   .live-layout {
     display: grid; grid-template-columns: 1.4fr 0.9fr; gap: 16px;
   }
@@ -449,7 +465,7 @@
       </div>
       <div>
         <h1>UAE & Saudi Construction News</h1>
-        <p>Search for monitoring. Live tab posts one story per hour.</p>
+        <p>Search for monitoring. Live tab posts automatically the moment new news is confirmed.</p>
       </div>
     </div>
     <div class="topbar-right">
@@ -469,7 +485,9 @@
   <div class="tabs" role="tablist">
     <button type="button" class="tab-btn active" data-tab="search">Search</button>
     <button type="button" class="tab-btn" data-tab="live">Live</button>
-    <button type="button" class="tab-btn" data-tab="log">Log</button>
+    <button type="button" class="tab-btn" data-tab="newslog">News Log</button>
+    <button type="button" class="tab-btn" data-tab="log">Send Log</button>
+    <button type="button" class="tab-btn" data-tab="connect">Connect WhatsApp</button>
   </div>
 
   <div class="tab-panel active" id="tab-search">
@@ -663,10 +681,14 @@
     <div class="live-bar">
       <div>
         <h2>Today's live news</h2>
-        <p id="liveMeta">Stories stay here for one day. The group gets one post per hour.</p>
+        <p id="liveMeta">Stories stay here for one day. New stories post automatically when auto-send is on.</p>
       </div>
       <div class="live-actions">
-        <span class="countdown" id="liveCountdown">Next post: checking…</span>
+        <label class="auto-toggle" for="autoSendToggle">
+          <input type="checkbox" id="autoSendToggle">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span id="autoSendLabel">Auto-send: off</span>
+        </label>
         <button type="button" class="ghost-btn" id="refreshLiveBtn">Refresh live</button>
         <button type="button" class="whatsapp-btn" id="postNextBtn">Post next</button>
       </div>
@@ -674,6 +696,36 @@
     <div class="panel">
       <h3>Live feed <span class="section-count" id="liveCount">0</span></h3>
       <div id="liveFeed"><div class="empty">Open this tab to load today's news.</div></div>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-newslog">
+    <div class="live-bar">
+      <div>
+        <h2>News log</h2>
+        <p id="newsLogMeta">Every story detected so far, whether it was sent or not.</p>
+      </div>
+      <div class="live-actions">
+        <button type="button" class="ghost-btn" id="refreshNewsLogBtn">Refresh</button>
+      </div>
+    </div>
+    <div class="panel log-panel">
+      <div class="table-wrap">
+        <table class="log-table" id="newsLogTable">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>News</th>
+              <th>Category</th>
+              <th>Country</th>
+              <th>Discovered</th>
+            </tr>
+          </thead>
+          <tbody id="newsLogTableBody">
+            <tr><td colspan="5" class="empty-cell">Open this tab to load the news log.</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -708,6 +760,27 @@
     </div>
   </div>
 
+  <div class="tab-panel" id="tab-connect">
+    <div class="live-bar">
+      <div>
+        <h2>Connect WhatsApp</h2>
+        <p id="connectMeta">Start the bot once in a terminal, then scan the code here.</p>
+      </div>
+      <div class="live-actions">
+        <span class="status-pill" id="connectStatusPill">checking…</span>
+        <button type="button" class="ghost-btn" id="refreshConnectBtn">Refresh</button>
+      </div>
+    </div>
+    <div class="panel" id="connectPanel">
+      <div class="empty">Open this tab to check WhatsApp connection status.</div>
+    </div>
+    <div class="panel" id="groupPanel" style="display:none; margin-top:16px;">
+      <h3>Choose your WhatsApp group</h3>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">This is the group new posts go to. You can change it any time.</p>
+      <div id="groupList"></div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -723,8 +796,36 @@
     localStorage.setItem('theme', newTheme);
   });
 
-  let nextSendSeconds = 0;
-  let countdownTimer = null;
+  let liveRefreshTimer = null;
+
+  function startLiveAutoRefresh() {
+    stopLiveAutoRefresh();
+    liveRefreshTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') loadLive(false, true);
+    }, 25000);
+  }
+
+  function stopLiveAutoRefresh() {
+    if (liveRefreshTimer) {
+      clearInterval(liveRefreshTimer);
+      liveRefreshTimer = null;
+    }
+  }
+
+  let connectPollTimer = null;
+
+  function startConnectPolling() {
+    stopConnectPolling();
+    refreshConnectState();
+    connectPollTimer = setInterval(refreshConnectState, 3000);
+  }
+
+  function stopConnectPolling() {
+    if (connectPollTimer) {
+      clearInterval(connectPollTimer);
+      connectPollTimer = null;
+    }
+  }
 
   function switchTab(name) {
     document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -733,7 +834,18 @@
     document.querySelectorAll('.tab-panel').forEach(panel => {
       panel.classList.toggle('active', panel.id === `tab-${name}`);
     });
-    if (name === 'live') loadLive();
+    if (name === 'live') {
+      loadLive();
+      startLiveAutoRefresh();
+    } else {
+      stopLiveAutoRefresh();
+    }
+    if (name === 'connect') {
+      startConnectPolling();
+    } else {
+      stopConnectPolling();
+    }
+    if (name === 'newslog') loadNewsLog();
     if (name === 'log') loadLog();
     history.replaceState(null, '', name === 'search' ? '#' : `#${name}`);
   }
@@ -742,26 +854,33 @@
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   });
 
-  function formatCountdown(seconds) {
-    if (seconds <= 0) return 'Ready to post now';
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    if (h > 0) return `Next post in ${h}h ${m}m`;
-    return `Next post in ${m}m ${s}s`;
+  function setAutoToggle(isOn) {
+    const toggle = document.getElementById('autoSendToggle');
+    const label = document.getElementById('autoSendLabel');
+    if (!toggle) return;
+    toggle.checked = !!isOn;
+    label.textContent = isOn ? 'Auto-send: on' : 'Auto-send: off';
   }
 
-  function startCountdown(seconds) {
-    nextSendSeconds = seconds;
-    const el = document.getElementById('liveCountdown');
-    if (countdownTimer) clearInterval(countdownTimer);
-    const tick = () => {
-      el.textContent = formatCountdown(nextSendSeconds);
-      if (nextSendSeconds > 0) nextSendSeconds -= 1;
-    };
-    tick();
-    countdownTimer = setInterval(tick, 1000);
-  }
+  document.getElementById('autoSendToggle').addEventListener('change', async function () {
+    const desired = this.checked;
+    this.disabled = true;
+    try {
+      const response = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_send_enabled: desired })
+      });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Failed to update auto-send');
+      setAutoToggle(result.settings.auto_send_enabled);
+    } catch (error) {
+      alert('Failed to update auto-send: ' + error.message);
+      setAutoToggle(!desired);
+    } finally {
+      this.disabled = false;
+    }
+  });
 
   function escapeHtml(text) {
     return String(text || '')
@@ -775,9 +894,11 @@
     const feed = document.getElementById('liveFeed');
     const articles = data.articles || [];
     document.getElementById('liveCount').textContent = articles.length;
+    const autoOn = !!(data.queue && data.queue.auto_send_enabled);
+    setAutoToggle(autoOn);
     document.getElementById('liveMeta').textContent =
-      `Updated ${data.fetched_at || 'just now'}. ${data.queue?.count || 0} waiting. One post per hour.`;
-    startCountdown(data.queue?.seconds_until_next || 0);
+      `Updated ${data.fetched_at || 'just now'}. ${data.queue?.count || 0} waiting. ` +
+      (autoOn ? 'Auto-send is on — new stories post automatically.' : 'Auto-send is off — nothing posts until you turn it on or post manually.');
 
     if (!articles.length) {
       feed.innerHTML = '<div class="empty">No live news for today yet. Fresh stories will stay here for one day.</div>';
@@ -836,30 +957,171 @@
     }
   }
 
-  async function loadLive(refresh = false) {
+  function renderNewsLogTable(entries) {
+    const body = document.getElementById('newsLogTableBody');
+    const meta = document.getElementById('newsLogMeta');
+    meta.textContent = `${entries.length} stor${entries.length === 1 ? 'y' : 'ies'} discovered so far.`;
+
+    if (!entries.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty-cell">Nothing discovered yet.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = entries.map(item => `
+      <tr>
+        <td>${escapeHtml(item.source || '-')}</td>
+        <td class="news"><a class="title" href="${escapeHtml(item.link || '#')}" target="_blank">${escapeHtml(item.title || '-')}</a></td>
+        <td>${escapeHtml(item.category || '-')}</td>
+        <td>${escapeHtml(item.country || '-')}</td>
+        <td>${escapeHtml(item.discovered_at || '-')}</td>
+      </tr>
+    `).join('');
+  }
+
+  async function loadNewsLog() {
+    const body = document.getElementById('newsLogTableBody');
+    body.innerHTML = '<tr><td colspan="5" class="empty-cell">Loading news log…</td></tr>';
+    try {
+      const response = await fetch('/api/news-log');
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Failed to load news log');
+      renderNewsLogTable(data.log || []);
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="5" class="empty-cell">Could not load news log: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  async function loadLive(refresh = false, silent = false) {
     const feed = document.getElementById('liveFeed');
-    feed.innerHTML = '<div class="empty"><span class="spinner"></span> Loading today\'s live news…</div>';
+    if (!silent) {
+      feed.innerHTML = '<div class="empty"><span class="spinner"></span> Loading today\'s live news…</div>';
+    }
     try {
       const response = await fetch(`/api/live${refresh ? '?refresh=1' : ''}`);
       const data = await response.json();
       if (!data.success) throw new Error(data.error || 'Failed to load live news');
       renderLive(data);
     } catch (error) {
-      feed.innerHTML = `<div class="empty">Could not load live news: ${escapeHtml(error.message)}</div>`;
+      if (silent) {
+        console.error('Live auto-refresh failed:', error);
+      } else {
+        feed.innerHTML = `<div class="empty">Could not load live news: ${escapeHtml(error.message)}</div>`;
+      }
     }
   }
 
   document.getElementById('refreshLiveBtn').addEventListener('click', () => loadLive(true));
   document.getElementById('refreshLogBtn').addEventListener('click', () => loadLog());
+  document.getElementById('refreshNewsLogBtn').addEventListener('click', () => loadNewsLog());
 
-  async function postNext(id = null, force = false) {
+  async function refreshConnectState() {
+    const pill = document.getElementById('connectStatusPill');
+    const panel = document.getElementById('connectPanel');
+    const groupPanel = document.getElementById('groupPanel');
+    try {
+      const response = await fetch('/api/whatsapp/status');
+      const data = await response.json();
+
+      if (!data.reachable) {
+        pill.textContent = 'Bot not running';
+        pill.className = 'status-pill failed';
+        groupPanel.style.display = 'none';
+        panel.innerHTML = `
+          <p>Start the WhatsApp bot first. In a terminal, in the project folder, run:</p>
+          <pre style="background:var(--surface-2);padding:12px 14px;border-radius:8px;overflow-x:auto;font-size:13px">node whatsapp_selfhosted.js</pre>
+          <p style="color:var(--muted);font-size:13px">This page checks automatically every few seconds - no need to refresh by hand.</p>`;
+        return;
+      }
+
+      if (data.ready) {
+        pill.textContent = 'Connected';
+        pill.className = 'status-pill sent';
+        panel.innerHTML = '<p>✓ WhatsApp is connected and ready to post.</p>';
+        groupPanel.style.display = '';
+        loadGroups();
+        return;
+      }
+
+      pill.textContent = 'Waiting for scan';
+      pill.className = 'status-pill waiting';
+      groupPanel.style.display = 'none';
+
+      const qrResponse = await fetch('/api/whatsapp/qr');
+      const qrData = await qrResponse.json();
+      if (qrData.success && qrData.qr) {
+        panel.innerHTML = `
+          <div style="text-align:center">
+            <img src="${qrData.qr}" alt="WhatsApp QR code" style="width:260px;height:260px;border-radius:12px;border:1px solid var(--border)">
+            <p style="margin-top:14px">Open WhatsApp on the spare phone → <strong>Settings → Linked Devices → Link a Device</strong></p>
+            <p style="color:var(--muted);font-size:13px">The code refreshes automatically if it expires before you scan it.</p>
+          </div>`;
+      } else {
+        panel.innerHTML = '<div class="empty">Bot is starting up, waiting for a QR code…</div>';
+      }
+    } catch (error) {
+      pill.textContent = 'Error';
+      pill.className = 'status-pill failed';
+      panel.innerHTML = `<div class="empty">Could not check WhatsApp status: ${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  async function loadGroups() {
+    const list = document.getElementById('groupList');
+    list.innerHTML = '<div class="empty">Loading groups…</div>';
+    try {
+      const response = await fetch('/api/whatsapp/groups');
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Failed to load groups');
+      const groups = data.groups || [];
+      if (!groups.length) {
+        list.innerHTML = '<div class="empty">No groups found. Make sure the spare number is in at least one WhatsApp group.</div>';
+        return;
+      }
+      list.innerHTML = groups.map(g => `
+        <div class="live-item">
+          <div class="live-item-top">
+            <div>${escapeHtml(g.name)}</div>
+            <button type="button" class="mini-post" data-group-id="${escapeHtml(g.id)}">Use this group</button>
+          </div>
+        </div>
+      `).join('');
+    } catch (error) {
+      list.innerHTML = `<div class="empty">Could not load groups: ${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  document.getElementById('refreshConnectBtn').addEventListener('click', () => refreshConnectState());
+  document.getElementById('groupList').addEventListener('click', async (event) => {
+    const btn = event.target.closest('[data-group-id]');
+    if (!btn) return;
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = 'Saving…';
+    try {
+      const response = await fetch('/api/whatsapp/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId: btn.dataset.groupId })
+      });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Failed to save');
+      btn.textContent = 'Saved ✓';
+    } catch (error) {
+      alert('Failed to save group: ' + error.message);
+      btn.textContent = originalText;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  async function postNext(id = null) {
     const btn = document.getElementById('postNextBtn');
     btn.disabled = true;
     try {
       const response = await fetch('/api/send-next', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, force })
+        body: JSON.stringify({ id })
       });
       const result = await response.json();
       if (!result.success) {
@@ -873,15 +1135,17 @@
     }
   }
 
-  document.getElementById('postNextBtn').addEventListener('click', () => postNext(null, true));
+  document.getElementById('postNextBtn').addEventListener('click', () => postNext(null));
   document.getElementById('liveFeed').addEventListener('click', (event) => {
     const btn = event.target.closest('.mini-post');
     if (!btn) return;
-    postNext(btn.dataset.id, true);
+    postNext(btn.dataset.id);
   });
 
   if (location.hash === '#live') switchTab('live');
+  if (location.hash === '#newslog') switchTab('newslog');
   if (location.hash === '#log') switchTab('log');
+  if (location.hash === '#connect') switchTab('connect');
 
   // Form submission handling
   document.getElementById('searchForm').addEventListener('submit', function () {
@@ -993,7 +1257,7 @@
         return;
       }
 
-      const confirmed = confirm(`Queue ${articles.length} article(s)? The group gets one post per hour.`);
+      const confirmed = confirm(`Queue ${articles.length} article(s)? They'll post automatically if auto-send is on.`);
       if (!confirmed) return;
 
       whatsappBtn.disabled = true;

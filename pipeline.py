@@ -6,11 +6,13 @@ import json
 import os
 import hashlib
 from urllib.parse import quote
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
-from sources import AWARD_KEYWORDS, COUNTRY_KEYWORDS, TRUSTED_PUBLISHERS, CONSTRUCTION_KEYWORDS
+from sources import COUNTRY_KEYWORDS, TRUSTED_PUBLISHERS, CONSTRUCTION_KEYWORDS
+from store import article_id
 
 # Cache settings
 CACHE_DIR = "cache"
@@ -43,8 +45,17 @@ async def fetch_feed_async(session, url):
 
 def build_search_url(publisher_domain, country, keyword=None, date_from=None, date_to=None):
     """Build a Google News RSS search URL scoped to one publisher and one
-    country, that only asks about award-related construction news.
-    
+    country, topically anchored to construction news.
+
+    Deliberately does NOT put the award-keyword OR-list (see
+    classify_category) into this query: Google silently stops honoring
+    `when:` once the query gets that long/complex, so a giant OR-list here
+    was making the date filter a no-op - it returned "best textual match"
+    articles from any year, and the app's own date-range filter then threw
+    almost all of them away. classify_category() already re-checks for
+    award language client-side with more precision than a keyword-soup
+    Google query could anyway, so that's the only place it needs to happen.
+
     Args:
         publisher_domain: Domain to search (e.g., "zawya.com")
         country: "UAE" or "Saudi Arabia"
@@ -52,15 +63,8 @@ def build_search_url(publisher_domain, country, keyword=None, date_from=None, da
         date_from: Optional start date (YYYY-MM-DD format)
         date_to: Optional end date (YYYY-MM-DD format)
     """
-    keyword_phrases = []
-    for phrase_list in AWARD_KEYWORDS.values():
-        keyword_phrases.extend(phrase_list)
+    query_parts = [f"site:{publisher_domain}", "construction"]
 
-    keywords_part = " OR ".join(f'"{phrase}"' for phrase in keyword_phrases)
-    
-    # Build base query
-    query_parts = [f"site:{publisher_domain}", "construction", f"({keywords_part})"]
-    
     # Add optional keyword filter
     if keyword:
         query_parts.append(f'"{keyword}"')
@@ -178,10 +182,6 @@ def save_seen_ids(seen_ids, path="seen.json"):
         json.dump(list(seen_ids), f)
 
 
-def make_id(title, link):
-    return hashlib.sha256(f"{title}{link}".encode()).hexdigest()[:16]
-
-
 def get_cache_key(keyword, date_from, date_to, category):
     """Generate a cache key based on search parameters."""
     params = f"{keyword}|{date_from}|{date_to}|{category}"
@@ -293,8 +293,127 @@ async def fetch_all_feeds_parallel(keyword=None, date_from=None, date_to=None):
         for publisher, country, task in tasks:
             articles = await task
             results.append((publisher, country, articles))
-        
+
         return results
+
+
+def dedup_articles(feed_results, category_filter=None):
+    """Classify and cross-source-dedupe raw feed entries.
+
+    feed_results: list of (publisher, country, raw_entries) as returned by
+    fetch_all_feeds_parallel. Returns a list of dicts (title, link, source,
+    cat, country, published) - no id, no date-range filtering; callers
+    handle those via finalize_articles.
+    """
+    seen_articles = {}
+    for publisher, _country, articles in feed_results:
+        for a in articles:
+            cat = classify_category(a.title)
+            country_tag = classify_country(a.title)
+
+            if cat is None or country_tag is None:
+                continue
+            if category_filter and cat != category_filter:
+                continue
+
+            title_clean = a.title.lower().strip()
+            for prefix in ["saudi arabia:", "uae:", "dubai:", "abu dhabi:", "riyadh:"]:
+                if title_clean.startswith(prefix):
+                    title_clean = title_clean[len(prefix):].strip()
+            for src in ["zawya", "meed", "construction week", "trade arabia", "arab news", "khaleej times"]:
+                title_clean = title_clean.replace(f"| {src}", "").replace(f"- {src}", "")
+            title_normalized = "".join(c for c in title_clean if c.isalnum() or c.isspace())[:60].strip()
+
+            is_duplicate = False
+            best_match_key = None
+            for seen_key in list(seen_articles.keys()):
+                seen_words = set(seen_key.split())
+                new_words = set(title_normalized.split())
+                if not seen_words or not new_words:
+                    continue
+                common_words = seen_words & new_words
+                similarity = len(common_words) / max(len(seen_words), len(new_words))
+                if similarity >= 0.85:
+                    is_duplicate = True
+                    best_match_key = seen_key
+                    break
+
+            if is_duplicate:
+                existing = seen_articles[best_match_key]
+                try:
+                    if TRUSTED_PUBLISHERS.index(publisher) < TRUSTED_PUBLISHERS.index(existing["source"]):
+                        del seen_articles[best_match_key]
+                        seen_articles[title_normalized] = {
+                            "title": a.title,
+                            "link": a.link,
+                            "source": publisher,
+                            "cat": cat,
+                            "country": country_tag,
+                            "published": a.get("published", ""),
+                        }
+                except ValueError:
+                    pass
+                continue
+
+            seen_articles[title_normalized] = {
+                "title": a.title,
+                "link": a.link,
+                "source": publisher,
+                "cat": cat,
+                "country": country_tag,
+                "published": a.get("published", ""),
+            }
+
+    return list(seen_articles.values())
+
+
+def finalize_articles(deduped, date_from=None, date_to=None):
+    """Turn deduped article dicts into the app's result shape: adds an id
+    and a formatted date string, and applies date-range filtering when both
+    bounds are given."""
+    results = []
+    for article_data in deduped:
+        published_raw = article_data["published"]
+        try:
+            article_date = parsedate_to_datetime(published_raw)
+            date_str = article_date.strftime("%Y-%m-%d")
+            if date_from and date_to:
+                search_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=article_date.tzinfo)
+                search_end = datetime.strptime(date_to, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=article_date.tzinfo
+                )
+                if article_date < search_start or article_date > search_end:
+                    continue
+        except Exception:
+            date_str = ""
+            if date_from and date_to:
+                continue
+
+        results.append({
+            "id": article_id(article_data["title"], article_data["link"]),
+            "title": article_data["title"],
+            "link": article_data["link"],
+            "category": article_data["cat"],
+            "country": article_data["country"],
+            "source": article_data["source"],
+            "date": date_str,
+        })
+    return results
+
+
+async def fetch_and_dedup(keyword=None, date_from=None, date_to=None, category_filter=None):
+    feed_results = await fetch_all_feeds_parallel(keyword, date_from, date_to)
+    return dedup_articles(feed_results, category_filter)
+
+
+def fetch_and_dedup_sync(keyword=None, date_from=None, date_to=None, category_filter=None):
+    """Sync wrapper for Flask routes and background threads."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(fetch_and_dedup(keyword, date_from, date_to, category_filter))
+    finally:
+        loop.close()
 
 
 def main():
@@ -317,7 +436,7 @@ def main():
             if category is None or article_country is None:
                 continue
 
-            item_id = make_id(a.title, a.link)
+            item_id = article_id(a.title, a.link)
             if item_id in seen_ids:
                 continue
 

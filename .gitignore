@@ -24,6 +24,8 @@ sent_whatsapp.json
 live_news.json
 send_queue.json
 whatsapp_log.json
+news_log.json
+settings.json
 
 # Cache and config
 cache/

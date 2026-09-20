@@ -1,6 +1,6 @@
 # Construction News App - UAE & Saudi Arabia
 
-Automated construction news aggregator that fetches, classifies, and posts news from 70+ trusted sources to WhatsApp.
+Automated construction news aggregator that fetches, classifies, and posts news from 38 trusted sources to WhatsApp - continuously, the moment a new non-duplicate story is confirmed.
 
 ## 📁 Project Structure
 
@@ -8,11 +8,13 @@ Automated construction news aggregator that fetches, classifies, and posts news 
 NEWSAPP/
 ├── app.py                      # Flask web application (main interface)
 ├── pipeline.py                 # News fetching & classification logic
-├── sources.py                  # Source configuration (70+ publishers)
+├── sources.py                  # Source configuration (38 publishers)
 ├── whatsapp_selfhosted.js      # Self-hosted WhatsApp bot (Node.js)
-├── alerter_selfhosted.py       # WhatsApp alerter (optional auto-posting)
+├── alerter_selfhosted.py       # Manual one-shot fallback (auto-posting lives in app.py)
 ├── selfhosted_config.json      # WhatsApp group configuration
 ├── sent_whatsapp.json          # Tracks sent articles (auto-generated)
+├── settings.json                # Auto-send on/off toggle (auto-generated)
+├── news_log.json                # Discovery history - everything found so far (auto-generated)
 ├── requirements.txt            # Python dependencies
 ├── package.json                # Node.js dependencies
 ├── .gitignore                  # Git ignore rules
@@ -66,14 +68,15 @@ python app.py
 ## 📊 Features
 
 ### Web Interface (http://127.0.0.1:5050)
-- ✅ Search 70+ sources in parallel (~15 seconds)
-- ✅ Smart deduplication (same news only once)
+- ✅ Search 38 sources in parallel (~15 seconds)
+- ✅ Smart deduplication (same news only once, even across different publishers)
 - ✅ Date range filtering
 - ✅ Category filtering (Contract/Project Awarded)
 - ✅ Live search within results
 - ✅ Sort by date, source, category
 - ✅ Export to CSV
-- ✅ **Send to WhatsApp button**
+- ✅ **One-click auto-send toggle** - on posts automatically, off means nothing sends until you do it manually
+- ✅ **News Log** - everything discovered so far, sent or not
 - ✅ Dark mode
 - ✅ Mobile responsive
 
@@ -86,7 +89,7 @@ python app.py
 ### WhatsApp Integration
 - ✅ Self-hosted (no third-party access)
 - ✅ Duplicate prevention
-- ✅ 3-second delay between messages (spam protection)
+- ✅ Posts as soon as a new story is confirmed; ~15-20s gap between messages when several land at once (spam protection)
 - ✅ Formatted messages with category, country, title, source, link
 - ✅ Tracks sent articles to avoid re-posting
 
@@ -94,19 +97,19 @@ python app.py
 
 ### `app.py` - Web Application
 - Flask web server
-- Handles search requests
-- Renders results
-- WhatsApp integration endpoint
+- Handles search requests, renders results
+- A background poller checks for fresh news continuously (every 10 minutes) and a background sender posts anything new the instant it's confirmed unique, whenever the auto-send toggle is on
+- WhatsApp integration endpoints
 
 ### `pipeline.py` - Core Logic
 - Fetches news from Google News RSS
-- Parallel async requests (140 searches simultaneously)
+- Parallel async requests
 - Classifies by category and country
-- Caches results (30 minutes)
-- Deduplication logic
+- Caches results (30 minutes, manual Search only)
+- Shared cross-source deduplication logic, used by both Search and the Live poller
 
 ### `sources.py` - Configuration
-- 70+ trusted publishers
+- 38 trusted publishers
 - Award keywords (wins, secured, awarded, etc.)
 - Construction keywords (building, infrastructure, etc.)
 - Country keywords (Dubai, Riyadh, NEOM, etc.)
@@ -117,24 +120,21 @@ python app.py
 - Endpoints: `/status`, `/groups`, `/send`
 - Session management
 
-### `alerter_selfhosted.py` - Auto-Poster (Optional)
-- Automatically checks for new news every 15 minutes
-- Posts to WhatsApp group
-- Can be used for fully automated workflow
+### `alerter_selfhosted.py` - Manual Fallback (Optional)
+- One-shot check you can run by hand (`python alerter_selfhosted.py [--dry-run]`)
+- `app.py` is now the continuous auto-poster, so `--watch` here is deprecated - running it alongside `app.py` would double-post
 
 ## 🎯 Daily Usage
 
-### Manual Workflow (Recommended)
-1. Open http://127.0.0.1:5050
-2. Click "Search" (leave dates empty for today's news)
-3. Review ~25-40 results
-4. Click green "Send to WhatsApp" button
-5. News posted to your group!
+1. Open http://127.0.0.1:5050 and start `node whatsapp_selfhosted.js` in another terminal
+2. Go to the **Live** tab and flip **Auto-send** on - fresh, non-duplicate news then posts to WhatsApp automatically, paced ~15-20s apart when several stories land at once
+3. Use the **News Log** tab to see everything that's been discovered so far, and the **Send Log** tab to see what actually went to WhatsApp
+4. Use **Search** any time for a manual lookup, and "Queue for WhatsApp" / "Post this" to send something by hand regardless of the toggle
 
-### Automatic Workflow (Optional)
+### One-shot manual check (optional)
 ```bash
-python alerter_selfhosted.py --watch
-# Checks every 15 minutes, posts new news automatically
+python alerter_selfhosted.py --dry-run
+# Prints what it would send, without posting
 ```
 
 ## 🔧 Configuration
@@ -155,7 +155,7 @@ Ensures sensitive data is not committed:
 - `cache/` - Search cache
 - `.venv/` - Python virtual environment
 
-## 🌐 Sources (70+)
+## 🌐 Sources (38)
 
 ### Major Construction Publications
 - Zawya, MEED, Construction Week Online
@@ -179,9 +179,9 @@ Ensures sensitive data is not committed:
 ### WhatsApp Bot Safety
 - ✅ Self-hosted (no third-party access)
 - ✅ Uses spare SIM (protects main account)
-- ✅ 3-second delay between messages
+- ✅ ~15-20s pacing between consecutive auto-sends (spam protection)
 - ✅ Duplicate prevention
-- ✅ Volume limits (25-40 news per day)
+- ✅ One toggle to stop all auto-posting instantly if needed
 
 ### Data Privacy
 - ✅ All data stored locally
@@ -197,13 +197,15 @@ Ensures sensitive data is not committed:
 
 ### Deduplication
 - Same news from different sources appears only once
-- Keeps version from most trusted source
-- 70% word similarity threshold
+- Keeps version from the most trusted source (order in `sources.py`)
+- 85% word similarity threshold
+- Runs identically for manual Search and the automatic Live poller (shared logic in `pipeline.py`)
 
 ### Performance
-- First search: ~15-20 seconds (140 parallel requests)
+- First search: ~15-20 seconds (76 parallel requests)
 - Cached searches: Instant (30-minute cache)
-- WhatsApp posting: 3 seconds per article
+- Live poller: checks for fresh news every 10 minutes
+- WhatsApp posting: ~15-20 seconds between consecutive auto-sends
 
 ## 🐛 Troubleshooting
 
@@ -245,27 +247,31 @@ Remove-Item cache\*.json
 
 ## 🎓 Understanding the Workflow
 
+Automatic (continuous, once auto-send is on):
 ```
-1. USER SEARCHES
+1. BACKGROUND POLLER (app.py, every 10 min)
    ↓
-2. FLASK (app.py)
-   ↓
-3. PIPELINE (pipeline.py)
-   ├─ Fetch from 70 sources (parallel)
+2. PIPELINE (pipeline.py)
+   ├─ Fetch from 38 sources (parallel)
    ├─ Classify articles
-   ├─ Deduplicate
+   ├─ Deduplicate (same story across publishers -> one entry)
    └─ Return results
    ↓
-4. USER REVIEWS
+3. MERGE into today's live feed + NEWS LOG (everything discovered)
    ↓
-5. CLICK "SEND TO WHATSAPP"
+4. Genuinely new items → SEND QUEUE
    ↓
-6. FLASK → WhatsApp Bot API
+5. BACKGROUND SENDER (app.py, ticks every 5s)
+   ├─ Only sends if the auto-send toggle is on
+   ├─ Paces consecutive sends ~15-20s apart
+   └─ WhatsApp Bot (whatsapp_selfhosted.js) posts to the group, tracks sent articles
+```
+
+Manual (any time, toggle or no toggle):
+```
+1. USER SEARCHES or clicks "Post this" on a Live-tab item
    ↓
-7. WhatsApp Bot (whatsapp_selfhosted.js)
-   ├─ Format messages
-   ├─ Post to group
-   └─ Track sent articles
+2. FLASK (app.py) → WhatsApp Bot API → posted immediately
 ```
 
 ## 📄 License

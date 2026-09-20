@@ -4,10 +4,13 @@
 # Self-hosted WhatsApp alerter - works with whatsapp_selfhosted.js
 # No third-party service, everything runs on your computer.
 #
+# `python app.py` is now the continuous auto-poster (poll + auto-send with
+# a toggle) - see app.py. This script is a manual one-shot fallback only;
+# --watch is deprecated because running it alongside app.py would double-post.
+#
 # Commands:
 #   python alerter_selfhosted.py                 one check, send new items
 #   python alerter_selfhosted.py --dry-run       print messages, do not send
-#   python alerter_selfhosted.py --watch         keep checking every 15 minutes
 #   python alerter_selfhosted.py --list-groups   show WhatsApp group ids
 
 import argparse
@@ -28,13 +31,11 @@ from pipeline import (
     classify_category,
     classify_country,
     fetch_all_feeds_parallel,
-    make_id,
 )
-from store import format_whatsapp_message, mark_failed, mark_sent
+from store import article_id, format_whatsapp_message, mark_failed, mark_sent
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "selfhosted_config.json")
 SENT_PATH = os.path.join(os.path.dirname(__file__), "sent_whatsapp.json")
-WATCH_MINUTES = 60
 MAX_PER_RUN = 1
 
 
@@ -124,7 +125,7 @@ def collect_new_items(sent_ids):
                 continue
             seen_titles.add(title_key)
 
-            item_id = make_id(article.title, article.link)
+            item_id = article_id(article.title, article.link)
             if item_id in sent_ids:
                 continue
 
@@ -198,7 +199,7 @@ def main():
         description="Post new construction news to WhatsApp group (self-hosted)."
     )
     parser.add_argument("--dry-run", action="store_true", help="Print messages without sending")
-    parser.add_argument("--watch", action="store_true", help="Keep checking every 15 minutes")
+    parser.add_argument("--watch", action="store_true", help="Deprecated - use `python app.py` instead")
     parser.add_argument("--list-groups", action="store_true", help="List WhatsApp group ids")
     args = parser.parse_args()
 
@@ -228,11 +229,12 @@ def main():
 
     try:
         if args.watch:
-            print(f"Watching for new news every {WATCH_MINUTES} minutes. Ctrl+C to stop.")
-            print("Make sure node whatsapp_selfhosted.js is running in another terminal.\n")
-            while True:
-                run_once(dry_run=args.dry_run)
-                time.sleep(WATCH_MINUTES * 60)
+            print("--watch is deprecated: `python app.py` now polls continuously and")
+            print("auto-sends on its own (toggle it on in the Live tab). Running this")
+            print("script's --watch at the same time would double-fetch and race with")
+            print("app.py on the same queue/log files. Run `python app.py` instead.")
+            print("This script still works for a manual one-shot check:")
+            print("  python alerter_selfhosted.py [--dry-run]")
         else:
             run_once(dry_run=args.dry_run)
     except KeyboardInterrupt:

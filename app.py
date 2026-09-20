@@ -1,48 +1,52 @@
 # app.py
 #
 # Monitoring UI + Live tab. Manual search stays on Search.
-# Live keeps today's news for one day and posts one WhatsApp message per hour.
+# A background poller watches for fresh news continuously; a background
+# sender posts anything new to WhatsApp the moment it's confirmed unique,
+# as long as the auto-send toggle is on. Manual "Post this" always works
+# as an override, toggle or no toggle.
 #
 # Run with:  python app.py
 # Then open: http://127.0.0.1:5050
 
 from flask import Flask, render_template, request, jsonify
-from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
-import asyncio
 import json
 import os
+import random
 import threading
 import time
 import requests
 
 from pipeline import (
-    fetch_all_feeds_parallel,
-    classify_category,
-    classify_country,
+    fetch_and_dedup_sync,
+    finalize_articles,
     get_cache_key,
     load_from_cache,
     save_to_cache,
 )
-from sources import TRUSTED_PUBLISHERS
 from store import (
     article_id,
     enqueue_articles,
     format_whatsapp_message,
     load_live,
     load_log,
+    load_news_log,
     load_queue,
     load_sent_ids,
+    load_settings,
+    log_discovered,
     mark_failed,
     mark_sent,
-    save_live,
-    seconds_until_next_send,
+    merge_into_live,
+    save_settings,
 )
 
 app = Flask(__name__)
 
 WHATSAPP_CONFIG_FILE = "selfhosted_config.json"
-SEND_INTERVAL_SECONDS = 60 * 60
+POLL_INTERVAL_SECONDS = 10 * 60  # how often the poller checks for fresh news
+SEND_PACE_SECONDS = (15, 20)  # gap between consecutive auto-sends when several land at once
 
 
 def collect_articles(keyword, date_from, date_to, category_filter=None):
@@ -54,99 +58,8 @@ def collect_articles(keyword, date_from, date_to, category_filter=None):
                 item["id"] = article_id(item["title"], item["link"])
         return cached_results, True
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    feed_results = loop.run_until_complete(
-        fetch_all_feeds_parallel(keyword or None, date_from, date_to)
-    )
-    loop.close()
-
-    seen_articles = {}
-    for publisher, _country, articles in feed_results:
-        for a in articles:
-            cat = classify_category(a.title)
-            country_tag = classify_country(a.title)
-
-            if cat is None or country_tag is None:
-                continue
-            if category_filter and cat != category_filter:
-                continue
-
-            title_clean = a.title.lower().strip()
-            for prefix in ["saudi arabia:", "uae:", "dubai:", "abu dhabi:", "riyadh:"]:
-                if title_clean.startswith(prefix):
-                    title_clean = title_clean[len(prefix):].strip()
-            for src in ["zawya", "meed", "construction week", "trade arabia", "arab news", "khaleej times"]:
-                title_clean = title_clean.replace(f"| {src}", "").replace(f"- {src}", "")
-            title_normalized = "".join(c for c in title_clean if c.isalnum() or c.isspace())[:60].strip()
-
-            is_duplicate = False
-            best_match_key = None
-            for seen_key in list(seen_articles.keys()):
-                seen_words = set(seen_key.split())
-                new_words = set(title_normalized.split())
-                if not seen_words or not new_words:
-                    continue
-                common_words = seen_words & new_words
-                similarity = len(common_words) / max(len(seen_words), len(new_words))
-                if similarity >= 0.85:
-                    is_duplicate = True
-                    best_match_key = seen_key
-                    break
-
-            if is_duplicate:
-                existing = seen_articles[best_match_key]
-                try:
-                    if TRUSTED_PUBLISHERS.index(publisher) < TRUSTED_PUBLISHERS.index(existing["source"]):
-                        del seen_articles[best_match_key]
-                        seen_articles[title_normalized] = {
-                            "title": a.title,
-                            "link": a.link,
-                            "source": publisher,
-                            "cat": cat,
-                            "country": country_tag,
-                            "published": a.get("published", ""),
-                        }
-                except ValueError:
-                    pass
-                continue
-
-            seen_articles[title_normalized] = {
-                "title": a.title,
-                "link": a.link,
-                "source": publisher,
-                "cat": cat,
-                "country": country_tag,
-                "published": a.get("published", ""),
-            }
-
-    results = []
-    for article_data in seen_articles.values():
-        published_raw = article_data["published"]
-        try:
-            article_date = parsedate_to_datetime(published_raw)
-            date_str = article_date.strftime("%Y-%m-%d")
-            if date_from and date_to:
-                search_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=article_date.tzinfo)
-                search_end = datetime.strptime(date_to, "%Y-%m-%d").replace(
-                    hour=23, minute=59, second=59, tzinfo=article_date.tzinfo
-                )
-                if article_date < search_start or article_date > search_end:
-                    continue
-        except Exception:
-            date_str = ""
-            if date_from and date_to:
-                continue
-
-        results.append({
-            "id": article_id(article_data["title"], article_data["link"]),
-            "title": article_data["title"],
-            "link": article_data["link"],
-            "category": article_data["cat"],
-            "country": article_data["country"],
-            "source": article_data["source"],
-            "date": date_str,
-        })
+    deduped = fetch_and_dedup_sync(keyword or None, date_from, date_to, category_filter)
+    results = finalize_articles(deduped, date_from, date_to)
 
     save_to_cache(cache_key, results)
     return results, False
@@ -158,15 +71,23 @@ def fresh_date_range():
     return yesterday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
-def refresh_live_feed(force=False):
-    live = load_live()
-    if not force and not live.get("stale"):
-        return live, 0
+def run_poll_cycle():
+    """Fetch, dedupe, and merge today's news; log and queue anything new."""
     date_from, date_to = fresh_date_range()
-    articles, _from_cache = collect_articles(None, date_from, date_to)
-    live = save_live(articles)
-    added = enqueue_articles(articles)
-    return live, len(added)
+    deduped = fetch_and_dedup_sync(None, date_from, date_to)
+    articles = finalize_articles(deduped, date_from, date_to)
+    live, newly_added = merge_into_live(articles)
+    if newly_added:
+        log_discovered(newly_added)
+        enqueue_articles(newly_added)
+    return live, newly_added
+
+
+def refresh_live_feed(force=False):
+    if not force:
+        return load_live(), 0
+    live, newly_added = run_poll_cycle()
+    return live, len(newly_added)
 
 
 def load_whatsapp_config():
@@ -175,9 +96,28 @@ def load_whatsapp_config():
     return config["groupId"], config.get("botApiUrl", "http://localhost:3000")
 
 
+def get_bot_api_url():
+    """Like load_whatsapp_config but doesn't require groupId - used for the
+    connect/QR flow, which runs before a group has been chosen yet."""
+    try:
+        with open(WHATSAPP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        return config.get("botApiUrl", "http://localhost:3000")
+    except Exception:
+        return "http://localhost:3000"
+
+
 def bot_ready(bot_api_url):
     response = requests.get(f"{bot_api_url}/status", timeout=5)
     return bool(response.json().get("ready"))
+
+
+def bot_is_ready():
+    try:
+        _group_id, bot_api_url = load_whatsapp_config()
+        return bot_ready(bot_api_url)
+    except Exception:
+        return False
 
 
 def send_article_to_group(article):
@@ -209,37 +149,50 @@ def send_article_to_group(article):
         raise
 
 
-def try_auto_send():
+def sender_tick():
+    """Attempt one send from the queue if auto-send is on and possible.
+    Returns the resulting status ('sent', 'already_sent', 'failed'), or
+    None if nothing was attempted this tick."""
+    if not load_settings().get("auto_send_enabled"):
+        return None
     queue = load_queue()
-    remaining = seconds_until_next_send(queue)
-    if remaining > 0 or not queue.get("items"):
+    items = queue.get("items", [])
+    if not items:
+        return None
+    if not bot_is_ready():
         return None
     try:
-        _group_id, bot_api_url = load_whatsapp_config()
-        if not bot_ready(bot_api_url):
-            print("Hourly sender: WhatsApp bot is not ready")
-            return None
+        _entry, status = send_article_to_group(items[0])
+        return status
     except Exception as exc:
-        print(f"Hourly sender: {exc}")
-        return None
-    item = queue["items"][0]
-    entry, status = send_article_to_group(item)
-    return entry if status == "sent" else None
+        print(f"Sender: {exc}")
+        return "failed"
 
 
-def hourly_sender_loop():
+def sender_loop():
+    time.sleep(8)
+    while True:
+        status = None
+        try:
+            status = sender_tick()
+        except Exception as exc:
+            print(f"Sender: {exc}")
+        time.sleep(random.uniform(*SEND_PACE_SECONDS) if status else 5)
+
+
+def poller_loop():
     time.sleep(8)
     while True:
         try:
-            try_auto_send()
+            run_poll_cycle()
         except Exception as exc:
-            print(f"Hourly sender: {exc}")
-        time.sleep(30)
+            print(f"Poller: {exc}")
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
-def start_hourly_sender():
-    thread = threading.Thread(target=hourly_sender_loop, name="whatsapp-hourly", daemon=True)
-    thread.start()
+def start_background_loops():
+    threading.Thread(target=poller_loop, name="news-poller", daemon=True).start()
+    threading.Thread(target=sender_loop, name="whatsapp-sender", daemon=True).start()
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -288,8 +241,7 @@ def queue_payload():
         "items": queue.get("items", []),
         "count": len(queue.get("items", [])),
         "last_sent_at": queue.get("last_sent_at"),
-        "seconds_until_next": seconds_until_next_send(queue),
-        "interval_minutes": SEND_INTERVAL_SECONDS // 60,
+        "auto_send_enabled": load_settings().get("auto_send_enabled", False),
     }
 
 
@@ -334,6 +286,69 @@ def api_log():
     return jsonify({"success": True, "log": log, "queue": queue_payload()})
 
 
+@app.route("/api/news-log")
+def api_news_log():
+    return jsonify({"success": True, "log": load_news_log(200)})
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_get_settings():
+    return jsonify({"success": True, "settings": load_settings()})
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_set_settings():
+    data = request.get_json(silent=True) or {}
+    if "auto_send_enabled" not in data:
+        return jsonify({"success": False, "error": "auto_send_enabled is required"}), 400
+    settings = save_settings({"auto_send_enabled": bool(data["auto_send_enabled"])})
+    return jsonify({"success": True, "settings": settings})
+
+
+@app.route("/api/whatsapp/status")
+def api_whatsapp_status():
+    bot_api_url = get_bot_api_url()
+    try:
+        response = requests.get(f"{bot_api_url}/status", timeout=5)
+        return jsonify({"success": True, "reachable": True, "ready": bool(response.json().get("ready"))})
+    except Exception:
+        return jsonify({"success": True, "reachable": False, "ready": False})
+
+
+@app.route("/api/whatsapp/qr")
+def api_whatsapp_qr():
+    bot_api_url = get_bot_api_url()
+    try:
+        response = requests.get(f"{bot_api_url}/qr", timeout=5)
+        data = response.json()
+        return jsonify({"success": True, "ready": bool(data.get("ready")), "qr": data.get("qr")})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
+@app.route("/api/whatsapp/groups")
+def api_whatsapp_groups():
+    bot_api_url = get_bot_api_url()
+    try:
+        response = requests.get(f"{bot_api_url}/groups", timeout=15)
+        response.raise_for_status()
+        return jsonify({"success": True, "groups": response.json()})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
+@app.route("/api/whatsapp/config", methods=["POST"])
+def api_whatsapp_config():
+    data = request.get_json(silent=True) or {}
+    group_id = (data.get("groupId") or "").strip()
+    if not group_id:
+        return jsonify({"success": False, "error": "groupId is required"}), 400
+    config = {"groupId": group_id, "botApiUrl": get_bot_api_url()}
+    with open(WHATSAPP_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    return jsonify({"success": True, "config": config})
+
+
 @app.route("/api/queue-articles", methods=["POST"])
 def api_queue_articles():
     data = request.get_json(silent=True) or {}
@@ -345,25 +360,16 @@ def api_queue_articles():
         "success": True,
         "added": len(added),
         "queue": queue_payload(),
-        "message": f"Queued {len(added)} article(s). One post goes out every hour.",
+        "message": f"Queued {len(added)} article(s). They post automatically when auto-send is on.",
     })
 
 
 @app.route("/api/send-next", methods=["POST"])
 def api_send_next():
     data = request.get_json(silent=True) or {}
-    force = bool(data.get("force"))
     article_id_req = data.get("id")
 
     queue = load_queue()
-    remaining = seconds_until_next_send(queue)
-    if remaining > 0 and not force:
-        return jsonify({
-            "success": False,
-            "error": f"Next post is in {remaining // 60}m {remaining % 60}s. Wait so the group is not flooded.",
-            "queue": queue_payload(),
-        }), 429
-
     item = None
     if article_id_req:
         for queued in queue.get("items", []):
@@ -404,7 +410,7 @@ def api_send_next():
 
 @app.route("/send-to-whatsapp", methods=["POST"])
 def send_to_whatsapp():
-    """Queue selected search results. One item posts per hour."""
+    """Queue selected search results. They post automatically if auto-send is on."""
     try:
         data = request.get_json() or {}
         articles = data.get("articles", [])
@@ -412,11 +418,11 @@ def send_to_whatsapp():
             return jsonify({"success": False, "error": "No articles provided"}), 400
 
         added = enqueue_articles(articles)
-        sent_now = None
+        sent_now = False
         try:
-            sent_now = try_auto_send()
+            sent_now = sender_tick() == "sent"
         except Exception:
-            sent_now = None
+            sent_now = False
 
         extra = " Posted the first one now." if sent_now else ""
         return jsonify({
@@ -424,7 +430,7 @@ def send_to_whatsapp():
             "added": len(added),
             "sent": 1 if sent_now else 0,
             "queue": queue_payload(),
-            "message": f"Queued {len(added)} article(s). One post per hour.{extra}",
+            "message": f"Queued {len(added)} article(s).{extra}",
         })
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 500
@@ -432,5 +438,5 @@ def send_to_whatsapp():
 
 if __name__ == "__main__":
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
-        start_hourly_sender()
-    app.run(debug=True, port=5050)
+        start_background_loops()
+    app.run(debug=True, port=5050, threaded=True)

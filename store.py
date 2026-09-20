@@ -1,5 +1,6 @@
 # store.py
-# Persistence for live news (1 day), the hourly send queue, and the send log.
+# Persistence for live news (1 day), the discovery log, the send queue, the
+# send log, and the auto-send toggle.
 
 import hashlib
 import json
@@ -12,9 +13,12 @@ LIVE_FILE = os.path.join(BASE_DIR, "live_news.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "send_queue.json")
 LOG_FILE = os.path.join(BASE_DIR, "whatsapp_log.json")
 SENT_FILE = os.path.join(BASE_DIR, "sent_whatsapp.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+NEWS_LOG_FILE = os.path.join(BASE_DIR, "news_log.json")
 
-SEND_INTERVAL_SECONDS = 60 * 60  # one WhatsApp post per hour
 LOG_LIMIT = 200
+NEWS_LOG_LIMIT = 500
+DEFAULT_SETTINGS = {"auto_send_enabled": False}
 
 _lock = threading.Lock()
 
@@ -64,15 +68,26 @@ def load_live():
     return {**data, "stale": False}
 
 
-def save_live(articles):
-    data = {
-        "day": today_str(),
-        "fetched_at": now_iso(),
-        "articles": articles,
-    }
+def merge_into_live(new_articles):
+    """Merge freshly-fetched articles into today's live feed by id, instead
+    of overwriting it. Returns (live, newly_added) where newly_added is the
+    subset of new_articles not already present today - i.e. genuinely new."""
+    day = today_str()
     with _lock:
+        data = _read_json(LIVE_FILE, {"day": "", "articles": []})
+        if data.get("day") != day:
+            data = {"day": day, "articles": []}
+        existing = {a["id"]: a for a in data.get("articles", [])}
+        now = now_iso()
+        newly_added = []
+        for article in new_articles:
+            if article["id"] not in existing:
+                article = {**article, "discovered_at": now}
+                newly_added.append(article)
+                existing[article["id"]] = article
+        data = {"day": day, "fetched_at": now, "articles": list(existing.values())}
         _write_json(LIVE_FILE, data)
-    return {**data, "stale": False}
+    return {**data, "stale": False}, newly_added
 
 
 def load_queue():
@@ -89,7 +104,7 @@ def save_queue(queue):
 
 
 def enqueue_articles(articles):
-    """Add unseen articles to the hourly queue. Returns how many were added."""
+    """Add unseen articles to the send queue. Returns how many were added."""
     sent = load_sent_ids()
     with _lock:
         queue = _read_json(QUEUE_FILE, {"last_sent_at": None, "items": []})
@@ -178,21 +193,43 @@ def load_log(limit=200):
     return log[:limit]
 
 
-def seconds_until_next_send(queue=None):
-    if queue is None:
-        queue = load_queue()
-    last = queue.get("last_sent_at")
-    if not last:
-        items = queue.get("items") or []
-        last = items[0].get("queued_at") if items else None
-    if not last:
-        return 0
-    try:
-        last_dt = datetime.fromisoformat(last)
-    except ValueError:
-        return 0
-    remaining = SEND_INTERVAL_SECONDS - (datetime.now() - last_dt).total_seconds()
-    return max(0, int(remaining))
+def load_settings():
+    with _lock:
+        data = _read_json(SETTINGS_FILE, DEFAULT_SETTINGS.copy())
+    return {**DEFAULT_SETTINGS, **data}
+
+
+def save_settings(patch):
+    with _lock:
+        data = {**DEFAULT_SETTINGS, **_read_json(SETTINGS_FILE, {}), **patch}
+        _write_json(SETTINGS_FILE, data)
+    return data
+
+
+def log_discovered(articles):
+    """Append newly-discovered articles to the persistent discovery history,
+    independent of whether they ever get sent to WhatsApp."""
+    with _lock:
+        log = _read_json(NEWS_LOG_FILE, [])
+        now = now_iso()
+        for article in articles:
+            log.insert(0, {
+                "id": article.get("id") or article_id(article.get("title", ""), article.get("link", "")),
+                "title": article.get("title", ""),
+                "link": article.get("link", ""),
+                "source": article.get("source", ""),
+                "country": article.get("country", ""),
+                "category": article.get("category", ""),
+                "date": article.get("date", ""),
+                "discovered_at": article.get("discovered_at") or now,
+            })
+        _write_json(NEWS_LOG_FILE, log[:NEWS_LOG_LIMIT])
+
+
+def load_news_log(limit=200):
+    with _lock:
+        log = _read_json(NEWS_LOG_FILE, [])
+    return log[:limit]
 
 
 def format_whatsapp_message(article):

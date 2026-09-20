@@ -11,7 +11,8 @@
 // 5. In another terminal: python alerter_selfhosted.py --watch
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const qrcode = require('qrcode');
 const express = require('express');
 
 // Create Express server for Python to communicate with
@@ -20,6 +21,7 @@ app.use(express.json());
 
 let client;
 let isReady = false;
+let latestQr = null; // data URL of the current QR image, or null when not needed
 
 // Initialize WhatsApp client with local authentication
 client = new Client({
@@ -38,37 +40,63 @@ client = new Client({
             '--disable-gpu'
         ]
     },
-    qrMaxRetries: 5
+    qrMaxRetries: 20
 });
 
-// Show QR code in terminal
-client.on('qr', (qr) => {
+// Show QR code in terminal, and keep a scannable image version for the web UI
+client.on('qr', async (qr) => {
     console.log('\n===========================================');
     console.log('Scan this QR code with your spare WhatsApp:');
     console.log('===========================================\n');
-    qrcode.generate(qr, { small: true });
+    qrcodeTerminal.generate(qr, { small: true });
     console.log('\nOpen WhatsApp on your phone:');
     console.log('Settings → Linked Devices → Link a Device');
+    console.log('\n(Or scan it from the "Connect WhatsApp" tab in the web app instead.)');
+    try {
+        latestQr = await qrcode.toDataURL(qr);
+    } catch (err) {
+        console.error('Failed to render QR image for the web UI:', err.message);
+    }
+});
+
+// A code got scanned and WhatsApp accepted it - about to finish loading
+client.on('authenticated', () => {
+    console.log('\n✓ QR scan accepted by WhatsApp - finishing setup...');
+});
+
+// A scan was attempted but WhatsApp rejected it (wrong reason shows up here,
+// e.g. device limit, expired code, account restriction)
+client.on('auth_failure', (msg) => {
+    console.error('\n✗ WhatsApp REJECTED the link attempt:', msg);
+    console.error('This usually means the linked-devices limit (max 4) was hit,');
+    console.error('or the phone lost internet mid-scan. Check Settings -> Linked');
+    console.error('Devices on the phone, remove anything unused, then try again.');
 });
 
 // Client is ready
 client.on('ready', () => {
     console.log('\n✓ WhatsApp is connected and ready!');
-    console.log('✓ Session saved locally in .whatsapp-session/');
+    console.log('✓ Session saved locally in .whatsapp-session-new/');
     console.log('✓ API server listening on http://localhost:3000');
-    console.log('\nNow run: python alerter_selfhosted.py --watch\n');
     isReady = true;
+    latestQr = null;
 });
 
 // Handle disconnection
 client.on('disconnected', (reason) => {
     console.log('WhatsApp disconnected:', reason);
     isReady = false;
+    latestQr = null;
 });
 
 // API endpoint: check if bot is ready
 app.get('/status', (req, res) => {
     res.json({ ready: isReady });
+});
+
+// API endpoint: current QR code image (data URL), for the web UI to display
+app.get('/qr', (req, res) => {
+    res.json({ ready: isReady, qr: isReady ? null : latestQr });
 });
 
 // API endpoint: list groups
