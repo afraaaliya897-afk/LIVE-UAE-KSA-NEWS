@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from llm_judge import AWARD_CATEGORIES
 
@@ -16,12 +16,20 @@ QUEUE_FILE = os.path.join(BASE_DIR, "send_queue.json")
 LOG_FILE = os.path.join(BASE_DIR, "whatsapp_log.json")
 SENT_FILE = os.path.join(BASE_DIR, "sent_whatsapp.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+NEWS_LOG_FILE = os.path.join(BASE_DIR, "news_log.json")
 EXTRACTED_FILE = os.path.join(BASE_DIR, "extracted_news.json")
 LLM_PICKS_FILE = os.path.join(BASE_DIR, "llm_picks.json")
 
-LOG_LIMIT = 200
-NEWS_LOG_LIMIT = 500
 DEFAULT_SETTINGS = {"auto_send_enabled": False}
+
+# UAE/KSA business-day cutoff (Asia/Dubai, UTC+4, no DST). Monitoring now
+# runs continuously (no more fixed 8AM-5PM window), so there's no longer a
+# scheduling gap for a "yesterday after 5PM" story to fall into - every
+# story gets caught within one ~10-minute poll cycle of being discovered.
+# "Today's news" is therefore just that, again: published today - but
+# checked properly against the article's real timestamp converted to this
+# timezone, instead of the old naive string-equality-on-date comparison.
+BUSINESS_TZ = timezone(timedelta(hours=4))
 
 _lock = threading.Lock()
 
@@ -35,7 +43,12 @@ def now_iso():
 
 
 def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+    """"Today" in the business timezone, not the host machine's local time -
+    load-bearing once this runs somewhere other than a UAE-based machine
+    (e.g. a UTC-default AWS instance), since live_news.json's day-bookkeeping
+    needs to agree with is_fresh()'s notion of "today" or Live can spuriously
+    reset around the host's own midnight instead of the business one."""
+    return datetime.now(BUSINESS_TZ).strftime("%Y-%m-%d")
 
 
 def _read_json(path, default):
@@ -72,32 +85,44 @@ def load_live():
 
 
 def merge_into_live(new_articles):
-    """Replace today's live feed with LLM-approved award articles.
+    """Set today's live feed to this LLM-approved list.
 
-    Old unjudged items are dropped so Live never shows keyword leftovers.
+    A story kept earlier today is removed if this run no longer approves it.
+    Same story from another publisher is not added again.
     Returns (live, newly_added).
     """
     day = today_str()
     with _lock:
         data = _read_json(LIVE_FILE, {"day": "", "articles": []})
-        if data.get("day") != day:
-            data = {"day": day, "articles": []}
-        existing = {
-            a["id"]: a
-            for a in data.get("articles", [])
-            if a.get("llm_approved") and a.get("category") in AWARD_CATEGORIES
-        }
+        previous = data.get("articles", []) if data.get("day") == day else []
+        previous_titles = [a.get("title", "") for a in previous]
         now = now_iso()
+        accepted = []
         newly_added = []
         for article in new_articles:
             article = {**article, "llm_approved": True}
-            if article["id"] not in existing:
+            title = article.get("title", "")
+            if _is_duplicate_title(title, [a.get("title", "") for a in accepted]):
+                continue
+            already_known = _is_duplicate_title(title, previous_titles) or any(
+                a.get("id") == article.get("id") for a in previous
+            )
+            if not already_known:
                 article = {**article, "discovered_at": now}
                 newly_added.append(article)
             else:
-                article = {**existing[article["id"]], **article}
-            existing[article["id"]] = article
-        data = {"day": day, "fetched_at": now, "articles": list(existing.values())}
+                prior = next(
+                    (
+                        a for a in previous
+                        if a.get("id") == article.get("id")
+                        or titles_are_same_story(title, a.get("title", ""))
+                    ),
+                    None,
+                )
+                if prior and prior.get("discovered_at"):
+                    article = {**article, "discovered_at": prior["discovered_at"]}
+            accepted.append(article)
+        data = {"day": day, "fetched_at": now, "articles": accepted}
         _write_json(LIVE_FILE, data)
     return {**data, "stale": False}, newly_added
 
@@ -115,57 +140,77 @@ def save_queue(queue):
         _write_json(QUEUE_FILE, queue)
 
 
-def _normalize_title_for_dedup(title):
-    """Normalize title for duplicate detection."""
-    clean = title.lower().strip()
-    # Remove common prefixes
-    for prefix in ["saudi arabia:", "uae:", "dubai:", "abu dhabi:", "riyadh:"]:
-        if clean.startswith(prefix):
-            clean = clean[len(prefix):].strip()
-    # Remove source suffixes
-    for src in ["zawya", "meed", "construction week", "trade arabia", "arab news", 
-                "khaleej times", "gulf news", "arabianbusiness", "argaam", "emirates 24|7"]:
-        clean = clean.replace(f"| {src}", "").replace(f"- {src}", "")
-        clean = clean.replace(f" - {src}.com", "").replace(f" | {src}.com", "")
-    # Keep only alphanumeric and spaces
-    return "".join(c for c in clean if c.isalnum() or c.isspace()).strip()
+_TITLE_STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "for", "on", "at", "by",
+    "with", "from", "as", "is", "are", "was", "be", "its", "it", "after",
+    "before", "new", "says", "said", "over", "into", "than", "that", "this",
+    "all", "has", "have", "will", "set", "out", "up", "per",
+}
+_PUBLISHER_TOKENS = {
+    "zawya", "meed", "gulf", "news", "khaleej", "times", "arabian", "business",
+    "arab", "national", "reuters", "bloomberg", "constructionweek", "tradearabia",
+    "argaam", "emirates", "okaz", "wam", "spa", "com",
+}
 
 
-def _is_duplicate_title(new_title, existing_titles, threshold=0.80):
-    """Check if new_title is similar to any existing titles using word overlap."""
-    new_norm = _normalize_title_for_dedup(new_title)
-    new_words = set(new_norm.split())
-    if not new_words:
-        return False
-    
-    for existing_title in existing_titles:
-        existing_norm = _normalize_title_for_dedup(existing_title)
-        existing_words = set(existing_norm.split())
-        if not existing_words:
+def _story_tokens(title):
+    """Content words used to tell whether two headlines are the same story."""
+    clean = (title or "").lower()
+    clean = clean.split(" - ")[0]
+    clean = "".join(ch if ch.isalnum() else " " for ch in clean)
+    tokens = []
+    for word in clean.split():
+        if len(word) <= 2 or word in _TITLE_STOPWORDS or word in _PUBLISHER_TOKENS:
             continue
-        
-        common_words = new_words & existing_words
-        similarity = len(common_words) / max(len(new_words), len(existing_words))
-        if similarity >= threshold:
-            return True
-    return False
+        if word.isdigit():
+            continue
+        tokens.append(word)
+    return set(tokens)
 
 
-def _is_today(date_str):
-    """Check if date_str is today's date."""
-    if not date_str:
+def titles_are_same_story(left, right):
+    """True when two headlines are the same story, including different publishers.
+
+    Uses both overall overlap and how much of the shorter headline is contained
+    in the longer one, so a rewrite still matches.
+    """
+    left_tokens = _story_tokens(left)
+    right_tokens = _story_tokens(right)
+    if len(left_tokens) < 3 or len(right_tokens) < 3:
+        return False
+    shared = left_tokens & right_tokens
+    if len(shared) < 3:
+        return False
+    jaccard = len(shared) / len(left_tokens | right_tokens)
+    contained = len(shared) / min(len(left_tokens), len(right_tokens))
+    return jaccard >= 0.5 or (len(shared) >= 4 and contained >= 0.55)
+
+
+def _is_duplicate_title(new_title, existing_titles):
+    return any(titles_are_same_story(new_title, existing) for existing in existing_titles)
+
+
+def is_fresh(published_at):
+    """True when an article was published on today's calendar date, in the
+    business timezone (BUSINESS_TZ). A missing/unparseable timestamp is
+    treated as not fresh - fail closed, same as the rest of the pipeline's
+    safety checks."""
+    if not published_at:
         return False
     try:
-        article_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        today = datetime.now().date()
-        return article_date == today
-    except (ValueError, AttributeError):
+        published = datetime.fromisoformat(published_at)
+    except (ValueError, TypeError):
         return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    published_date = published.astimezone(BUSINESS_TZ).date()
+    today_date = datetime.now(BUSINESS_TZ).date()
+    return published_date == today_date
 
 
 def enqueue_articles(articles):
-    """Add unseen articles to the send queue with improved duplicate detection. 
-    ONLY TODAY'S NEWS is queued. Returns how many were added."""
+    """Add unseen articles to the send queue with improved duplicate detection.
+    ONLY FRESH NEWS (see is_fresh) is queued. Returns how many were added."""
     sent = load_sent_ids()
     with _lock:
         queue = _read_json(QUEUE_FILE, {"last_sent_at": None, "items": []})
@@ -174,15 +219,16 @@ def enqueue_articles(articles):
         
         # Also check against recent log entries to avoid re-queueing recently sent items
         log = _read_json(LOG_FILE, [])
-        recent_titles = [entry.get("title", "") for entry in log[:50]]  # Check last 50 sent
+        recent_titles = [entry.get("title", "") for entry in log]
+        news_log = _read_json(NEWS_LOG_FILE, [])
+        recent_titles.extend(entry.get("title", "") for entry in news_log)
         
         added = []
         for article in articles:
-            # STRICT: Only queue TODAY's news
-            article_date = article.get("date", "")
-            if not _is_today(article_date):
+            # STRICT: Only queue news still inside the fresh window
+            if not is_fresh(article.get("published_at", "")):
                 continue
-            
+
             cat = article.get("category") or article.get("cat")
             if cat and cat not in AWARD_CATEGORIES:
                 continue
@@ -205,6 +251,7 @@ def enqueue_articles(articles):
                 "country": article.get("country", ""),
                 "category": cat or "",
                 "date": article.get("date", ""),
+                "published_at": article.get("published_at", ""),
                 "queued_at": now_iso(),
             }
             queue.setdefault("items", []).append(item)
@@ -248,7 +295,7 @@ def append_log(entry):
     with _lock:
         log = _read_json(LOG_FILE, [])
         log.insert(0, entry)
-        _write_json(LOG_FILE, log[:LOG_LIMIT])
+        _write_json(LOG_FILE, log)
     return entry
 
 
@@ -257,13 +304,17 @@ def mark_sent(item, group_id=""):
     with _lock:
         log = _read_json(LOG_FILE, [])
         log.insert(0, entry)
-        _write_json(LOG_FILE, log[:LOG_LIMIT])
+        _write_json(LOG_FILE, log)
         sent = set(_read_json(SENT_FILE, []))
         sent.add(entry["id"])
         _save_sent_ids_unlocked(sent)
         queue = _read_json(QUEUE_FILE, {"last_sent_at": None, "items": []})
         queue["last_sent_at"] = entry["sent_at"]
-        queue["items"] = [q for q in queue.get("items", []) if q.get("id") != entry["id"]]
+        queue["items"] = [
+            q for q in queue.get("items", [])
+            if q.get("id") != entry["id"]
+            and not titles_are_same_story(entry.get("title", ""), q.get("title", ""))
+        ]
         _write_json(QUEUE_FILE, queue)
     return entry
 
@@ -296,8 +347,16 @@ def log_discovered(articles):
     independent of whether they ever get sent to WhatsApp."""
     with _lock:
         log = _read_json(NEWS_LOG_FILE, [])
+        known_titles = [entry.get("title", "") for entry in log]
+        known_ids = {entry.get("id") for entry in log}
         now = now_iso()
         for article in articles:
+            aid = article.get("id") or article_id(article.get("title", ""), article.get("link", ""))
+            title = article.get("title", "")
+            if aid in known_ids or _is_duplicate_title(title, known_titles):
+                continue
+            known_ids.add(aid)
+            known_titles.append(title)
             log.insert(0, {
                 "id": article.get("id") or article_id(article.get("title", ""), article.get("link", "")),
                 "title": article.get("title", ""),
@@ -308,7 +367,7 @@ def log_discovered(articles):
                 "date": article.get("date", ""),
                 "discovered_at": article.get("discovered_at") or now,
             })
-        _write_json(NEWS_LOG_FILE, log[:NEWS_LOG_LIMIT])
+        _write_json(NEWS_LOG_FILE, log)
 
 
 def load_news_log(limit=200):

@@ -4,7 +4,7 @@
 # Keywords in pipeline.py are a cheap net. This module is the strict judge.
 #
 # Set GEMINI_API_KEY or OPENAI_API_KEY in the environment or a local .env file.
-# If neither is set, pipeline.py falls back to keyword-only award matching.
+# If neither is set, nothing is approved. Keywords never count as an LLM pass.
 
 import json
 import os
@@ -15,29 +15,47 @@ import requests
 
 AWARD_CATEGORIES = ("Contract Awarded", "Project Awarded")
 BATCH_SIZE = 15
+_AWARD_CUE = re.compile(
+    r"\b(awarded|award|awards|wins|won|secures|secured|signed|signs|inks|inked|"
+    r"appointed|appoints|bags|bagged|clinches|clinched|contract|tender|epc|"
+    r"contractor|selected|named)\b",
+    re.IGNORECASE,
+)
 
-SYSTEM_PROMPT = """You judge Middle East construction news headlines.
+SYSTEM_PROMPT = """You are the final editor for a UAE and Saudi Arabia construction desk.
 
-KEEP a headline only if ALL of these are true:
-1) It is about physical construction, infrastructure, EPC, buildings, housing, or real-estate development.
-2) A contract/tender was awarded, signed, won, inked, or a contractor was appointed, or a JV was formed to actually develop/build a named project in the UAE or Saudi Arabia.
-3) The parties are developers, contractors, consultants, or government bodies in that construction story — not AI, software, IT, or unrelated finance companies.
+USER INTENT
+The reader wants only construction news from the UAE or Saudi Arabia where a project or a contract was actually awarded. Related means the same event told another way: tender won, EPC signed, contractor or consultant appointed, package awarded, joint venture formed to build a named project. It does not mean "anything about construction".
 
-If the headline never mentions construction, building, infrastructure, EPC, contractor, housing, roads, metro, airport, or a development project, REJECT it.
+NEWS INTENT
+Judge what the headline is reporting, not which keywords it contains.
+Ask: did someone award, win, sign, or get appointed to deliver physical construction work?
+If the headline is really about sales, prices, occupancy, the economy, oil, flights, policy, or commentary, the news intent is not an award. REJECT it.
 
-REJECT everything else, including:
-- building-permit statistics, market commentary, listings, sales ads
-- traffic accidents, CSR/charity
-- tech, AI, software, IT, telecom, or finance deals even if they say signed/inks/agreement
-- generic "construction sector grows" stories with no award
-- sports, defense, or oilfield service contracts that are not building/infrastructure construction
-- "exploring" or "in talks" with no award, appointment, or signed construction/development deal
+KEEP only when ALL are true:
+1) The work is physical construction, infrastructure, EPC, buildings, housing delivery, or real-estate development in the UAE or Saudi Arabia.
+2) The headline reports a completed award: awarded, won, secured, signed, inked, or a contractor/consultant was appointed.
+3) A named project, package, or scope is being given to a builder, developer, consultant, or government client.
+
+REJECT, even if the headline mentions construction, projects, homes, or a large sum:
+- homes sold, units sold out, sales, bookings, occupancy, hotel performance
+- market growth, forecasts, statistics, permit counts, "sector grows"
+- "plans", "eyes", "exploring", "in talks", "mulls", "proposed" with no award
+- oil, energy trading, flights, telecom, AI, software, IT, finance, defense, sports
+- CSR, accidents, appointments of CEOs that are not a construction contract
+
+Examples:
+KEEP "Besix awarded AED 500m contract to build Dubai metro station" -> Contract Awarded
+KEEP "NEOM appoints contractor for staff housing project" -> Project Awarded
+REJECT "Sharjah waterfront sells all homes before construction begins" -> sales, not an award
+REJECT "Saudi economy projected to grow" -> not construction
+REJECT "Developer exploring Riyadh tower" -> no award yet
 
 Return JSON only:
 {"results":[{"i":0,"keep":true,"category":"Contract Awarded"|"Project Awarded"|null,"reason":"short reason"}]}
-Use Contract Awarded for contracts/tenders/EPC deals.
-Use Project Awarded for project awards, contractor appointments, development JVs.
-If keep is false, category must be null. reason must be one short sentence.
+Contract Awarded = a contract, tender, or EPC deal was awarded or signed.
+Project Awarded = a project was awarded or a contractor was appointed to build it.
+If keep is false, category must be null. If you are unsure, keep must be false.
 """
 
 
@@ -160,21 +178,12 @@ def judge_award_articles(articles):
         }
 
     if not llm_configured():
-        kept, evaluations = [], []
-        for article in articles:
-            hint = article.get("cat") or article.get("category")
-            keep = hint in AWARD_CATEGORIES
-            category = hint if keep else None
-            reason = (
-                "Keyword match: award/contract language in the headline."
-                if keep else
-                "Keyword filter: not a contract or project award."
-            )
-            evaluations.append(row(article, keep, category, reason))
-            if keep:
-                kept.append({**article, "cat": category, "llm_approved": True})
-        print(f"LLM off — keyword award filter kept {len(kept)}/{len(articles)}", flush=True)
-        return kept, evaluations
+        evaluations = [
+            row(article, False, None, "LLM is not configured, so nothing is approved.")
+            for article in articles
+        ]
+        print("LLM off — nothing approved", flush=True)
+        return [], evaluations
 
     kept, evaluations = [], []
     for start in range(0, len(articles), BATCH_SIZE):
@@ -197,10 +206,18 @@ def judge_award_articles(articles):
         for i, article in enumerate(batch):
             item = by_index.get(i) or {}
             category = item.get("category")
-            keep = bool(item.get("keep")) and category in AWARD_CATEGORIES
             reason = (item.get("reason") or "").strip()
-            if not reason:
-                reason = "Construction contract/project award." if keep else "Not a construction contract or project award."
+            keep = bool(item.get("keep")) and category in AWARD_CATEGORIES
+            title = article.get("title") or ""
+            if keep and not _AWARD_CUE.search(title):
+                keep = False
+                reason = "Headline does not report an award, signed contract, or contractor appointment."
+            elif not reason:
+                reason = (
+                    "UAE/KSA construction contract or project award."
+                    if keep else
+                    "Not a UAE/KSA construction contract or project award."
+                )
             evaluations.append(row(article, keep, category if keep else None, reason))
             if keep:
                 kept.append({**article, "cat": category, "llm_approved": True})

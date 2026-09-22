@@ -19,7 +19,6 @@ import time
 import requests
 
 from pipeline import (
-    fetch_and_dedup_sync,
     fetch_candidates_sync,
     finalize_articles,
     get_cache_key,
@@ -28,9 +27,11 @@ from pipeline import (
 )
 from llm_judge import AWARD_CATEGORIES, judge_award_articles
 from store import (
+    BUSINESS_TZ,
     article_id,
     enqueue_articles,
     format_whatsapp_message,
+    is_fresh,
     load_extracted,
     load_live,
     load_llm_picks,
@@ -46,6 +47,7 @@ from store import (
     save_extracted,
     save_llm_picks,
     save_settings,
+    titles_are_same_story,
 )
 
 app = Flask(__name__)
@@ -59,6 +61,9 @@ _poll_running = False
 
 
 def collect_articles(keyword, date_from, date_to, category_filter=None):
+    """Tab 1 (Search): the raw pool. Date + keyword + source matching only -
+    no LLM relevance filtering. That gate lives in run_poll_cycle() instead,
+    downstream of Extracted/LLM Picked."""
     cache_key = get_cache_key(keyword or "", date_from or "", date_to or "", category_filter or "both")
     cached_results = load_from_cache(cache_key)
     if cached_results is not None:
@@ -67,49 +72,54 @@ def collect_articles(keyword, date_from, date_to, category_filter=None):
                 item["id"] = article_id(item["title"], item["link"])
         return cached_results, True
 
-    deduped = fetch_and_dedup_sync(keyword or None, date_from, date_to, category_filter)
-    results = finalize_articles(deduped, date_from, date_to)
+    raw = fetch_candidates_sync(keyword or None, date_from, date_to)
+    results = finalize_articles(raw, date_from, date_to)
+    if category_filter:
+        results = [item for item in results if item.get("category") == category_filter]
 
     save_to_cache(cache_key, results)
     return results, False
 
 
 def fresh_date_range():
-    """Return TODAY ONLY for 'fresh news' mode - strictly today's news."""
-    today = datetime.now()
-    return today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
-
-
-def is_today_news(article_date_str):
-    """Check if article is from today. Returns True only for today's date."""
-    if not article_date_str:
-        return False
-    try:
-        article_date = datetime.strptime(article_date_str, "%Y-%m-%d").date()
-        today = datetime.now().date()
-        return article_date == today
-    except (ValueError, AttributeError):
-        return False
+    """Search window for the continuous poller. Wider than 'today' so the
+    Google News query still surfaces a story even with the RSS feed's own
+    6-24h indexing lag; is_fresh() (calendar-day, business-timezone-based)
+    is what actually decides whether a matched article is new enough to
+    act on."""
+    today = datetime.now(BUSINESS_TZ)
+    yesterday = today - timedelta(days=1)
+    return yesterday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
 def run_poll_cycle():
-    """Fetch candidates, let the LLM pick awards, then merge into Live."""
+    """Fetch candidates, let the LLM pick awards, then merge into Live.
+
+    The search itself looks back further than today (fresh_date_range) to
+    absorb Google News RSS's own indexing lag, but Extracted/LLM Picked/Live
+    only ever show TODAY's news - yesterday's matches aren't lost, they're
+    already in News Log from whichever earlier cycle first caught them as
+    "today"."""
     date_from, date_to = fresh_date_range()
     raw = fetch_candidates_sync(None, date_from, date_to)
-    extracted = finalize_articles(raw, date_from, date_to)
+    finalized = finalize_articles(raw, date_from, date_to)
+    extracted = [item for item in finalized if is_fresh(item.get("published_at", ""))]
     save_extracted(extracted)
 
     to_judge = [{**item, "cat": item.get("category")} for item in extracted]
     kept, evaluations = judge_award_articles(to_judge)
     save_llm_picks(evaluations)
+    judge_failed = bool(evaluations) and all(
+        str(item.get("reason", "")).startswith("LLM error") for item in evaluations
+    )
+    if judge_failed:
+        return load_live(), []
 
     kept_by_id = {item.get("id"): item for item in kept}
     articles = []
     for item in extracted:
         chosen = kept_by_id.get(item["id"])
         if not chosen:
-            continue
-        if not is_today_news(item.get("date", "")):
             continue
         category = chosen.get("cat") or chosen.get("category")
         if category not in AWARD_CATEGORIES:
@@ -195,11 +205,10 @@ def send_article_to_group(article):
         if not bot_ready(bot_api_url):
             raise RuntimeError("WhatsApp bot is not ready. Start node whatsapp_selfhosted.js")
 
-        # STRICT: Only send TODAY's award news
-        article_date = article.get("date", "")
-        if not is_today_news(article_date):
-            print(f"Skipping old news (date: {article_date}): {article.get('title', '')[:50]}")
-            return None, "not_today"
+        # STRICT: Only send news still inside the fresh window
+        if not is_fresh(article.get("published_at", "")):
+            print(f"Skipping stale news (published_at: {article.get('published_at', '')}): {article.get('title', '')[:50]}")
+            return None, "not_fresh"
 
         if not article.get("llm_approved"):
             judged, _evals = judge_award_articles([{
@@ -217,14 +226,15 @@ def send_article_to_group(article):
             print(f"Skipping non-award news: {article.get('title', '')[:50]}")
             return None, "not_award"
 
-        # Check if already sent (first check)
         sent_ids = load_sent_ids()
         if aid in sent_ids:
             return None, "already_sent"
-
-        # Double-check right before sending to prevent race conditions
-        sent_ids = load_sent_ids()
-        if aid in sent_ids:
+        sent_titles = [
+            row.get("title", "")
+            for row in load_log(limit=None)
+            if row.get("status") == "sent"
+        ]
+        if any(titles_are_same_story(article.get("title", ""), sent_title) for sent_title in sent_titles):
             return None, "already_sent"
 
         message = format_whatsapp_message(article)
@@ -357,7 +367,7 @@ def api_live():
             continue
         if article.get("category") not in AWARD_CATEGORIES:
             continue
-        if not is_today_news(article.get("date", "")):
+        if not is_fresh(article.get("published_at", "")):
             continue
         status = "sent" if aid in sent_ids else "waiting"
         articles.append({**article, "id": aid, "status": status})
@@ -403,7 +413,10 @@ def api_log():
 
 @app.route("/api/news-log")
 def api_news_log():
-    return jsonify({"success": True, "log": load_news_log(200)})
+    try:
+        return jsonify({"success": True, "log": load_news_log(200)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc), "log": []}), 500
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -441,13 +454,29 @@ def api_whatsapp_qr():
         return jsonify({"success": False, "error": str(exc)}), 502
 
 
+@app.route("/api/whatsapp/disconnect", methods=["POST"])
+def api_whatsapp_disconnect():
+    bot_api_url = get_bot_api_url()
+    try:
+        response = requests.post(f"{bot_api_url}/disconnect", timeout=20)
+        response.raise_for_status()
+        return jsonify({"success": True, **response.json()})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
 @app.route("/api/whatsapp/groups")
 def api_whatsapp_groups():
     bot_api_url = get_bot_api_url()
+    params = {"refresh": "1"} if request.args.get("refresh") == "1" else {}
     try:
-        response = requests.get(f"{bot_api_url}/groups", timeout=15)
+        current_group_id, _ = load_whatsapp_config()
+    except Exception:
+        current_group_id = ""
+    try:
+        response = requests.get(f"{bot_api_url}/groups", params=params, timeout=15)
         response.raise_for_status()
-        return jsonify({"success": True, "groups": response.json()})
+        return jsonify({"success": True, "groups": response.json(), "current_group_id": current_group_id})
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 502
 

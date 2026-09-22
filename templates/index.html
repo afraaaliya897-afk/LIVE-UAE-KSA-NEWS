@@ -515,13 +515,6 @@
       </div>
     </div>
     <div class="field">
-      <label>Keyword</label>
-      <div class="input-wrap">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-        <input type="text" name="keyword" placeholder="NEOM, metro..." value="{{ form_values.keyword }}">
-      </div>
-    </div>
-    <div class="field">
       <label>Category</label>
       <div class="input-wrap select-wrap">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg>
@@ -847,15 +840,16 @@
       <div class="live-actions">
         <span class="status-pill" id="connectStatusPill">checking…</span>
         <button type="button" class="ghost-btn" id="refreshConnectBtn">Refresh</button>
+        <button type="button" class="ghost-btn" id="disconnectBtn" style="display:none;color:#b42318;border-color:#f3aca3">Disconnect / link a different number</button>
       </div>
     </div>
     <div class="panel" id="connectPanel">
       <div class="empty">Open this tab to check WhatsApp connection status.</div>
     </div>
     <div class="panel" id="groupPanel" style="display:none; margin-top:16px;">
-      <h3>Choose your WhatsApp group</h3>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">This is the group new posts go to. You can change it any time.</p>
-      <div id="groupList"></div>
+      <h3>WhatsApp group</h3>
+      <div id="currentGroupSummary"></div>
+      <div id="groupList" style="display:none; margin-top:10px;"></div>
     </div>
   </div>
 
@@ -1179,6 +1173,7 @@
     const pill = document.getElementById('connectStatusPill');
     const panel = document.getElementById('connectPanel');
     const groupPanel = document.getElementById('groupPanel');
+    const disconnectBtn = document.getElementById('disconnectBtn');
     try {
       const response = await fetch('/api/whatsapp/status');
       const data = await response.json();
@@ -1187,6 +1182,7 @@
         pill.textContent = 'Bot not running';
         pill.className = 'status-pill failed';
         groupPanel.style.display = 'none';
+        disconnectBtn.style.display = 'none';
         window._waGroupsLoaded = false;
         panel.innerHTML = `
           <p>Start the WhatsApp bot first. In a terminal, in the project folder, run:</p>
@@ -1200,6 +1196,7 @@
         pill.className = 'status-pill sent';
         panel.innerHTML = '<p>✓ WhatsApp is connected and ready to post.</p>';
         groupPanel.style.display = '';
+        disconnectBtn.style.display = '';
         if (!window._waGroupsLoaded) {
           window._waGroupsLoaded = true;
           loadGroups();
@@ -1211,6 +1208,7 @@
       pill.textContent = 'Waiting for scan';
       pill.className = 'status-pill waiting';
       groupPanel.style.display = 'none';
+      disconnectBtn.style.display = 'none';
 
       const qrResponse = await fetch('/api/whatsapp/qr');
       const qrData = await qrResponse.json();
@@ -1227,32 +1225,63 @@
     } catch (error) {
       pill.textContent = 'Error';
       pill.className = 'status-pill failed';
+      disconnectBtn.style.display = 'none';
       panel.innerHTML = `<div class="empty">Could not check WhatsApp status: ${escapeHtml(error.message)}</div>`;
     }
   }
 
+  let currentGroupId = '';
+  let allGroupsCache = [];
+
+  function renderGroupSummary() {
+    const summary = document.getElementById('currentGroupSummary');
+    const current = allGroupsCache.find(g => g.id === currentGroupId);
+    const currentName = current
+      ? current.name
+      : (currentGroupId ? 'Selected group not found in the current list - refresh to check' : 'None selected yet');
+    summary.innerHTML = `
+      <p style="color:var(--muted);font-size:13px;margin:0 0 10px;">New posts go to:</p>
+      <div class="live-item" style="border:0;padding:0 0 4px 0;">
+        <div class="live-item-top">
+          <div style="font-weight:700">${escapeHtml(currentName)}</div>
+          <button type="button" class="ghost-btn" id="changeGroupBtn">Change group</button>
+        </div>
+      </div>`;
+    document.getElementById('changeGroupBtn').addEventListener('click', () => {
+      const list = document.getElementById('groupList');
+      list.style.display = (list.style.display === 'none' || !list.style.display) ? '' : 'none';
+    });
+  }
+
   async function loadGroups() {
+    const summary = document.getElementById('currentGroupSummary');
     const list = document.getElementById('groupList');
-    list.innerHTML = '<div class="empty">Loading groups…</div>';
+    summary.innerHTML = '<div class="empty">Loading groups…</div>';
+    list.innerHTML = '';
+    list.style.display = 'none';
     try {
-      const response = await fetch('/api/whatsapp/groups');
+      const response = await fetch('/api/whatsapp/groups?refresh=1');
       const data = await response.json();
       if (!data.success) throw new Error(data.error || 'Failed to load groups');
-      const groups = data.groups || [];
-      if (!groups.length) {
+      allGroupsCache = data.groups || [];
+      currentGroupId = data.current_group_id || '';
+      renderGroupSummary();
+      if (!allGroupsCache.length) {
         list.innerHTML = '<div class="empty">No groups found. Make sure the spare number is in at least one WhatsApp group.</div>';
         return;
       }
-      list.innerHTML = groups.map(g => `
+      list.innerHTML = allGroupsCache.map(g => `
         <div class="live-item">
           <div class="live-item-top">
-            <div>${escapeHtml(g.name)}</div>
-            <button type="button" class="mini-post" data-group-id="${escapeHtml(g.id)}">Use this group</button>
+            <div>${escapeHtml(g.name)}${g.id === currentGroupId ? ' <span class="badge project">Current</span>' : ''}</div>
+            ${g.id === currentGroupId
+              ? '<span class="status-pill sent">Active</span>'
+              : `<button type="button" class="mini-post" data-group-id="${escapeHtml(g.id)}">Use this group</button>`}
           </div>
         </div>
       `).join('');
     } catch (error) {
-      list.innerHTML = `<div class="empty">Could not load groups: ${escapeHtml(error.message)}</div>`;
+      summary.innerHTML = `<div class="empty">Could not load groups: ${escapeHtml(error.message)}</div>`;
     }
   }
 
@@ -1260,9 +1289,32 @@
     window._waGroupsLoaded = false;
     refreshConnectState();
   });
+  document.getElementById('disconnectBtn').addEventListener('click', async function () {
+    const confirmed = confirm(
+      'This immediately unlinks the current WhatsApp number. Nothing will post until a new QR code is scanned with the new number. Continue?'
+    );
+    if (!confirmed) return;
+    this.disabled = true;
+    this.textContent = 'Disconnecting…';
+    try {
+      const response = await fetch('/api/whatsapp/disconnect', { method: 'POST' });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Failed to disconnect');
+    } catch (error) {
+      alert('Failed to disconnect: ' + error.message);
+    } finally {
+      this.disabled = false;
+      this.textContent = 'Disconnect / link a different number';
+      window._waGroupsLoaded = false;
+      refreshConnectState();
+    }
+  });
   document.getElementById('groupList').addEventListener('click', async (event) => {
     const btn = event.target.closest('[data-group-id]');
     if (!btn) return;
+    const groupName = btn.closest('.live-item').querySelector('div').textContent;
+    const confirmed = confirm(`Send all future construction news to "${groupName}"? Any group currently in use will stop receiving posts.`);
+    if (!confirmed) return;
     btn.disabled = true;
     const originalText = btn.textContent;
     btn.textContent = 'Saving…';
@@ -1274,11 +1326,12 @@
       });
       const result = await response.json();
       if (!result.success) throw new Error(result.error || 'Failed to save');
-      btn.textContent = 'Saved ✓';
+      currentGroupId = btn.dataset.groupId;
+      renderGroupSummary();
+      document.getElementById('groupList').style.display = 'none';
     } catch (error) {
       alert('Failed to save group: ' + error.message);
       btn.textContent = originalText;
-    } finally {
       btn.disabled = false;
     }
   });

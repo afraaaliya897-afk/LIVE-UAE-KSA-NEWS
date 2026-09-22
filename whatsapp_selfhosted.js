@@ -12,6 +12,7 @@
 
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const qrcode = require('qrcode');
@@ -114,15 +115,10 @@ client.on('ready', () => {
 // Handle disconnection
 client.on('disconnected', (reason) => {
     console.log('WhatsApp disconnected:', reason);
-    isReady = false;
     latestQr = null;
     if (reason === 'LOGOUT') {
         console.log('Link again from the Connect WhatsApp tab (new QR in a few seconds).');
-        setTimeout(() => {
-            client.initialize().catch((err) => {
-                console.error('Re-init after logout failed:', err.message);
-            });
-        }, 3000);
+        scheduleReinit('logout');
     }
 });
 
@@ -136,14 +132,17 @@ app.get('/qr', (req, res) => {
     res.json({ ready: isReady, qr: isReady ? null : latestQr });
 });
 
-// API endpoint: list groups
+// API endpoint: list groups. ?refresh=1 bypasses the cache - needed after
+// the bot's number gets added to a new WhatsApp group, since cachedGroups
+// otherwise only clears on a reconnect, not on a normal request.
 app.get('/groups', async (req, res) => {
     try {
         if (!isReady) {
             return res.status(503).json({ error: 'WhatsApp not ready yet' });
         }
-        
-        if (cachedGroups) {
+
+        const forceRefresh = req.query.refresh === '1';
+        if (cachedGroups && !forceRefresh) {
             return res.json(cachedGroups);
         }
 
@@ -217,8 +216,40 @@ app.post('/send', async (req, res) => {
         await client.sendMessage(groupId, message);
         res.json({ success: true });
     } catch (error) {
+        console.error('Error sending message:', error);
+        if (String(error.message || '').includes('detached Frame')) {
+            scheduleReinit('detached Frame');
+        }
         res.status(500).json({ error: error.message });
     }
+});
+
+// API endpoint: fully unlink the current number so a different one can be
+// scanned in. Deliberately skips client.logout() - calling it can itself
+// fire the 'disconnected' event and race with this handler's own reconnect,
+// triggering client.initialize() twice concurrently. Instead this does a
+// direct hard reset (destroy + wipe the saved session folder, then reuse
+// the same guarded reconnect path as every other recovery in this file) so
+// a stale-but-technically-valid session can't silently keep reconnecting
+// to the OLD number. The number itself isn't cleanly unlinked from
+// WhatsApp's own Linked Devices list this way - that's a cosmetic leftover
+// the person can clear from their phone if they want to, not a functional
+// problem for us since we're wiping our own local session either way.
+app.post('/disconnect', async (req, res) => {
+    console.log('Disconnect requested: unlinking current number...');
+    try {
+        await client.destroy();
+    } catch (err) {
+        console.error('destroy() failed (continuing anyway):', err.message);
+    }
+    try {
+        fs.rmSync(WA_SESSION_DIR, { recursive: true, force: true });
+    } catch (err) {
+        console.error('Could not clear session folder:', err.message);
+    }
+
+    res.json({ success: true, message: 'Disconnected. A new QR code will appear shortly - scan it with the new number.' });
+    scheduleReinit('manual disconnect');
 });
 
 // Start Express server

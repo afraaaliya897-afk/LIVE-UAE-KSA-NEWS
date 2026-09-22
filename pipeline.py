@@ -12,8 +12,7 @@ import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from sources import COUNTRY_KEYWORDS, TRUSTED_PUBLISHERS, CONSTRUCTION_KEYWORDS
-from store import article_id
-from llm_judge import AWARD_CATEGORIES, judge_award_articles
+from store import BUSINESS_TZ, article_id, titles_are_same_story
 
 # Cache settings
 CACHE_DIR = "cache"
@@ -113,8 +112,9 @@ def matches_construction(title):
 def classify_category(title):
     """Cheap first-pass tag. Returns an award category or None.
 
-    This is not the final gate. fetch_and_dedup() still runs judge_award_articles()
-    so listings, permits stats, and unrelated deals do not get through.
+    This is not the final gate - it's a keyword hint shown in Search/Extracted.
+    llm_judge.judge_award_articles() is what decides Contract vs Project vs drop
+    before anything reaches Live or gets sent.
     """
     title_lower = title.lower()
     
@@ -311,11 +311,13 @@ async def fetch_all_feeds_parallel(keyword=None, date_from=None, date_to=None):
         return results
 
 
-def dedup_articles(feed_results, category_filter=None):
+def dedup_articles(feed_results):
     """Keep construction + UAE/Saudi headlines, then cross-source-dedupe.
 
-    Category is a keyword hint only. The LLM (or keyword fallback) in
-    fetch_and_dedup() is what decides Contract vs Project vs drop.
+    This is the raw pool: date + keyword (construction) + source (country)
+    matching only. Category here is a keyword hint only, never a relevance
+    filter - llm_judge.judge_award_articles() is what decides Contract vs
+    Project vs drop, further downstream in the poll cycle.
     """
     seen_articles = {}
     for publisher, _country, articles in feed_results:
@@ -323,53 +325,12 @@ def dedup_articles(feed_results, category_filter=None):
             if not matches_construction(a.title):
                 continue
 
-            cat = classify_category(a.title)
+            cat = classify_category(a.title) or "General Construction"
             country_tag = classify_country(a.title)
             if country_tag is None:
                 continue
-            if category_filter and cat != category_filter:
-                continue
 
-            title_clean = a.title.lower().strip()
-            for prefix in ["saudi arabia:", "uae:", "dubai:", "abu dhabi:", "riyadh:"]:
-                if title_clean.startswith(prefix):
-                    title_clean = title_clean[len(prefix):].strip()
-            for src in ["zawya", "meed", "construction week", "trade arabia", "arab news", "khaleej times"]:
-                title_clean = title_clean.replace(f"| {src}", "").replace(f"- {src}", "")
-            title_normalized = "".join(c for c in title_clean if c.isalnum() or c.isspace())[:60].strip()
-
-            is_duplicate = False
-            best_match_key = None
-            for seen_key in list(seen_articles.keys()):
-                seen_words = set(seen_key.split())
-                new_words = set(title_normalized.split())
-                if not seen_words or not new_words:
-                    continue
-                common_words = seen_words & new_words
-                similarity = len(common_words) / max(len(seen_words), len(new_words))
-                if similarity >= 0.85:
-                    is_duplicate = True
-                    best_match_key = seen_key
-                    break
-
-            if is_duplicate:
-                existing = seen_articles[best_match_key]
-                try:
-                    if TRUSTED_PUBLISHERS.index(publisher) < TRUSTED_PUBLISHERS.index(existing["source"]):
-                        del seen_articles[best_match_key]
-                        seen_articles[title_normalized] = {
-                            "title": a.title,
-                            "link": a.link,
-                            "source": publisher,
-                            "cat": cat,
-                            "country": country_tag,
-                            "published": a.get("published", ""),
-                        }
-                except ValueError:
-                    pass
-                continue
-
-            seen_articles[title_normalized] = {
+            incoming = {
                 "title": a.title,
                 "link": a.link,
                 "source": publisher,
@@ -377,20 +338,45 @@ def dedup_articles(feed_results, category_filter=None):
                 "country": country_tag,
                 "published": a.get("published", ""),
             }
+            match_key = next(
+                (key for key, seen in seen_articles.items() if titles_are_same_story(a.title, seen["title"])),
+                None,
+            )
+            if match_key:
+                existing = seen_articles[match_key]
+                try:
+                    incoming_rank = TRUSTED_PUBLISHERS.index(publisher)
+                    existing_rank = TRUSTED_PUBLISHERS.index(existing["source"])
+                except ValueError:
+                    incoming_rank, existing_rank = 10_000, 0
+                if incoming_rank < existing_rank:
+                    seen_articles[match_key] = incoming
+                continue
+
+            seen_articles[a.link or a.title] = incoming
 
     return list(seen_articles.values())
 
 
 def finalize_articles(deduped, date_from=None, date_to=None):
-    """Turn deduped article dicts into the app's result shape: adds an id
-    and a formatted date string, and applies date-range filtering when both
-    bounds are given."""
+    """Turn deduped article dicts into the app's result shape: adds an id,
+    a display date string, and a full published_at timestamp (used for
+    is_fresh()'s calendar-day check), and applies date-range filtering when
+    both bounds are given.
+
+    The display date is shown in BUSINESS_TZ (UAE/KSA, UTC+4), not the RSS
+    feed's own timezone (usually UTC) - otherwise something published at
+    9pm UTC (1am UAE time, i.e. already "today" locally) would display as
+    yesterday's date while is_fresh() correctly treats it as today, which
+    reads as a bug even though it isn't one."""
     results = []
     for article_data in deduped:
         published_raw = article_data["published"]
+        published_at = ""
         try:
             article_date = parsedate_to_datetime(published_raw)
-            date_str = article_date.strftime("%Y-%m-%d")
+            date_str = article_date.astimezone(BUSINESS_TZ).strftime("%Y-%m-%d")
+            published_at = article_date.isoformat()
             if date_from and date_to:
                 search_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=article_date.tzinfo)
                 search_end = datetime.strptime(date_to, "%Y-%m-%d").replace(
@@ -411,19 +397,9 @@ def finalize_articles(deduped, date_from=None, date_to=None):
             "country": article_data["country"],
             "source": article_data["source"],
             "date": date_str,
+            "published_at": published_at,
         })
     return results
-
-
-async def fetch_and_dedup(keyword=None, date_from=None, date_to=None, category_filter=None):
-    feed_results = await fetch_all_feeds_parallel(keyword, date_from, date_to)
-    # Do not apply category_filter here: the LLM may upgrade a weakly tagged
-    # headline into Contract/Project Awarded. Filter after the judge.
-    articles = dedup_articles(feed_results)
-    kept, _evaluations = judge_award_articles(articles)
-    if category_filter:
-        kept = [a for a in kept if a.get("cat") == category_filter]
-    return kept
 
 
 def fetch_candidates_sync(keyword=None, date_from=None, date_to=None):
@@ -433,16 +409,6 @@ def fetch_candidates_sync(keyword=None, date_from=None, date_to=None):
     try:
         feed_results = loop.run_until_complete(fetch_all_feeds_parallel(keyword, date_from, date_to))
         return dedup_articles(feed_results)
-    finally:
-        loop.close()
-
-
-def fetch_and_dedup_sync(keyword=None, date_from=None, date_to=None, category_filter=None):
-    """Sync wrapper for Flask routes and background threads."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(fetch_and_dedup(keyword, date_from, date_to, category_filter))
     finally:
         loop.close()
 
