@@ -25,12 +25,15 @@ live_news.json
 send_queue.json
 whatsapp_log.json
 news_log.json
+extracted_news.json
+llm_picks.json
 settings.json
 
 # Cache and config
 cache/
 whatsapp_config.json
 selfhosted_config.json
+.env
 
 # IDE
 .vscode/

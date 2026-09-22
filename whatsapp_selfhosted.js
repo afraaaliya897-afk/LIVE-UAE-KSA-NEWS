@@ -10,10 +10,23 @@
 // 4. Session saves locally in .whatsapp-session/
 // 5. In another terminal: python alerter_selfhosted.py --watch
 
+const path = require('path');
+const os = require('os');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const qrcode = require('qrcode');
 const express = require('express');
+
+// Keep session off OneDrive so Chrome/db files are not locked during sync.
+// On Linux/VPS: export WA_SESSION_DIR=/var/lib/newsapp-session
+const WA_SESSION_DIR = process.env.WA_SESSION_DIR || path.join(
+    process.env.LOCALAPPDATA || os.homedir(),
+    'NEWSAPP-whatsapp-session'
+);
+
+process.on('unhandledRejection', (err) => {
+    console.error('WhatsApp client error (API stays up):', err && err.message ? err.message : err);
+});
 
 // Create Express server for Python to communicate with
 const app = express();
@@ -22,11 +35,26 @@ app.use(express.json());
 let client;
 let isReady = false;
 let latestQr = null; // data URL of the current QR image, or null when not needed
+let cachedGroups = null;
+let reinitTimer = null;
+
+function scheduleReinit(reason) {
+    if (reinitTimer) return;
+    isReady = false;
+    cachedGroups = null;
+    console.log('WhatsApp page broke (' + reason + '). Reconnecting in 3s...');
+    reinitTimer = setTimeout(() => {
+        reinitTimer = null;
+        client.initialize().catch((err) => {
+            console.error('Re-init failed:', err.message);
+        });
+    }, 3000);
+}
 
 // Initialize WhatsApp client with local authentication
 client = new Client({
     authStrategy: new LocalAuth({
-        dataPath: '.whatsapp-session-new'
+        dataPath: WA_SESSION_DIR
     }),
     puppeteer: {
         headless: true,
@@ -76,10 +104,11 @@ client.on('auth_failure', (msg) => {
 // Client is ready
 client.on('ready', () => {
     console.log('\n✓ WhatsApp is connected and ready!');
-    console.log('✓ Session saved locally in .whatsapp-session-new/');
+    console.log(`✓ Session saved locally in ${WA_SESSION_DIR}`);
     console.log('✓ API server listening on http://localhost:3000');
     isReady = true;
     latestQr = null;
+    cachedGroups = null;
 });
 
 // Handle disconnection
@@ -87,6 +116,14 @@ client.on('disconnected', (reason) => {
     console.log('WhatsApp disconnected:', reason);
     isReady = false;
     latestQr = null;
+    if (reason === 'LOGOUT') {
+        console.log('Link again from the Connect WhatsApp tab (new QR in a few seconds).');
+        setTimeout(() => {
+            client.initialize().catch((err) => {
+                console.error('Re-init after logout failed:', err.message);
+            });
+        }, 3000);
+    }
 });
 
 // API endpoint: check if bot is ready
@@ -106,6 +143,10 @@ app.get('/groups', async (req, res) => {
             return res.status(503).json({ error: 'WhatsApp not ready yet' });
         }
         
+        if (cachedGroups) {
+            return res.json(cachedGroups);
+        }
+
         console.log('Fetching chats...');
         
         // Add retry logic with delay
@@ -146,9 +187,13 @@ app.get('/groups', async (req, res) => {
             }));
         
         console.log(`Found ${groups.length} groups`);
+        cachedGroups = groups;
         res.json(groups);
     } catch (error) {
         console.error('Error getting groups:', error);
+        if (String(error.message || '').includes('detached Frame')) {
+            scheduleReinit('detached Frame');
+        }
         res.status(500).json({ 
             error: error.message, 
             hint: 'Try restarting the bot or waiting a few minutes for WhatsApp to fully load'

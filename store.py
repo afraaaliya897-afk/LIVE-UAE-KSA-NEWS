@@ -8,13 +8,16 @@ import os
 import threading
 from datetime import datetime
 
+from llm_judge import AWARD_CATEGORIES
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LIVE_FILE = os.path.join(BASE_DIR, "live_news.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "send_queue.json")
 LOG_FILE = os.path.join(BASE_DIR, "whatsapp_log.json")
 SENT_FILE = os.path.join(BASE_DIR, "sent_whatsapp.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-NEWS_LOG_FILE = os.path.join(BASE_DIR, "news_log.json")
+EXTRACTED_FILE = os.path.join(BASE_DIR, "extracted_news.json")
+LLM_PICKS_FILE = os.path.join(BASE_DIR, "llm_picks.json")
 
 LOG_LIMIT = 200
 NEWS_LOG_LIMIT = 500
@@ -69,22 +72,31 @@ def load_live():
 
 
 def merge_into_live(new_articles):
-    """Merge freshly-fetched articles into today's live feed by id, instead
-    of overwriting it. Returns (live, newly_added) where newly_added is the
-    subset of new_articles not already present today - i.e. genuinely new."""
+    """Replace today's live feed with LLM-approved award articles.
+
+    Old unjudged items are dropped so Live never shows keyword leftovers.
+    Returns (live, newly_added).
+    """
     day = today_str()
     with _lock:
         data = _read_json(LIVE_FILE, {"day": "", "articles": []})
         if data.get("day") != day:
             data = {"day": day, "articles": []}
-        existing = {a["id"]: a for a in data.get("articles", [])}
+        existing = {
+            a["id"]: a
+            for a in data.get("articles", [])
+            if a.get("llm_approved") and a.get("category") in AWARD_CATEGORIES
+        }
         now = now_iso()
         newly_added = []
         for article in new_articles:
+            article = {**article, "llm_approved": True}
             if article["id"] not in existing:
                 article = {**article, "discovered_at": now}
                 newly_added.append(article)
-                existing[article["id"]] = article
+            else:
+                article = {**existing[article["id"]], **article}
+            existing[article["id"]] = article
         data = {"day": day, "fetched_at": now, "articles": list(existing.values())}
         _write_json(LIVE_FILE, data)
     return {**data, "stale": False}, newly_added
@@ -103,28 +115,101 @@ def save_queue(queue):
         _write_json(QUEUE_FILE, queue)
 
 
+def _normalize_title_for_dedup(title):
+    """Normalize title for duplicate detection."""
+    clean = title.lower().strip()
+    # Remove common prefixes
+    for prefix in ["saudi arabia:", "uae:", "dubai:", "abu dhabi:", "riyadh:"]:
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+    # Remove source suffixes
+    for src in ["zawya", "meed", "construction week", "trade arabia", "arab news", 
+                "khaleej times", "gulf news", "arabianbusiness", "argaam", "emirates 24|7"]:
+        clean = clean.replace(f"| {src}", "").replace(f"- {src}", "")
+        clean = clean.replace(f" - {src}.com", "").replace(f" | {src}.com", "")
+    # Keep only alphanumeric and spaces
+    return "".join(c for c in clean if c.isalnum() or c.isspace()).strip()
+
+
+def _is_duplicate_title(new_title, existing_titles, threshold=0.80):
+    """Check if new_title is similar to any existing titles using word overlap."""
+    new_norm = _normalize_title_for_dedup(new_title)
+    new_words = set(new_norm.split())
+    if not new_words:
+        return False
+    
+    for existing_title in existing_titles:
+        existing_norm = _normalize_title_for_dedup(existing_title)
+        existing_words = set(existing_norm.split())
+        if not existing_words:
+            continue
+        
+        common_words = new_words & existing_words
+        similarity = len(common_words) / max(len(new_words), len(existing_words))
+        if similarity >= threshold:
+            return True
+    return False
+
+
+def _is_today(date_str):
+    """Check if date_str is today's date."""
+    if not date_str:
+        return False
+    try:
+        article_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        today = datetime.now().date()
+        return article_date == today
+    except (ValueError, AttributeError):
+        return False
+
+
 def enqueue_articles(articles):
-    """Add unseen articles to the send queue. Returns how many were added."""
+    """Add unseen articles to the send queue with improved duplicate detection. 
+    ONLY TODAY'S NEWS is queued. Returns how many were added."""
     sent = load_sent_ids()
     with _lock:
         queue = _read_json(QUEUE_FILE, {"last_sent_at": None, "items": []})
         queued_ids = {item.get("id") for item in queue.get("items", [])}
+        queued_titles = [item.get("title", "") for item in queue.get("items", [])]
+        
+        # Also check against recent log entries to avoid re-queueing recently sent items
+        log = _read_json(LOG_FILE, [])
+        recent_titles = [entry.get("title", "") for entry in log[:50]]  # Check last 50 sent
+        
         added = []
         for article in articles:
+            # STRICT: Only queue TODAY's news
+            article_date = article.get("date", "")
+            if not _is_today(article_date):
+                continue
+            
+            cat = article.get("category") or article.get("cat")
+            if cat and cat not in AWARD_CATEGORIES:
+                continue
+
             aid = article.get("id") or article_id(article["title"], article["link"])
+            
+            # Skip if already sent or queued by ID
             if aid in sent or aid in queued_ids:
                 continue
+            
+            # Skip if title is too similar to something already queued or recently sent
+            if _is_duplicate_title(article["title"], queued_titles + recent_titles):
+                continue
+            
             item = {
                 "id": aid,
                 "title": article["title"],
                 "link": article["link"],
                 "source": article.get("source", ""),
                 "country": article.get("country", ""),
+                "category": cat or "",
                 "date": article.get("date", ""),
                 "queued_at": now_iso(),
             }
             queue.setdefault("items", []).append(item)
             queued_ids.add(aid)
+            queued_titles.append(article["title"])
             added.append(item)
         _write_json(QUEUE_FILE, queue)
     return added
@@ -230,6 +315,43 @@ def load_news_log(limit=200):
     with _lock:
         log = _read_json(NEWS_LOG_FILE, [])
     return log[:limit]
+
+
+def save_extracted(articles):
+    with _lock:
+        _write_json(EXTRACTED_FILE, {
+            "day": today_str(),
+            "fetched_at": now_iso(),
+            "articles": articles,
+        })
+
+
+def load_extracted():
+    with _lock:
+        return _read_json(EXTRACTED_FILE, {"day": "", "fetched_at": "", "articles": []})
+
+
+def save_llm_picks(evaluations):
+    kept = sum(1 for item in evaluations if item.get("keep"))
+    with _lock:
+        _write_json(LLM_PICKS_FILE, {
+            "day": today_str(),
+            "evaluated_at": now_iso(),
+            "kept": kept,
+            "dropped": len(evaluations) - kept,
+            "items": evaluations,
+        })
+
+
+def load_llm_picks():
+    with _lock:
+        return _read_json(LLM_PICKS_FILE, {
+            "day": "",
+            "evaluated_at": "",
+            "kept": 0,
+            "dropped": 0,
+            "items": [],
+        })
 
 
 def format_whatsapp_message(article):

@@ -20,16 +20,20 @@ import requests
 
 from pipeline import (
     fetch_and_dedup_sync,
+    fetch_candidates_sync,
     finalize_articles,
     get_cache_key,
     load_from_cache,
     save_to_cache,
 )
+from llm_judge import AWARD_CATEGORIES, judge_award_articles
 from store import (
     article_id,
     enqueue_articles,
     format_whatsapp_message,
+    load_extracted,
     load_live,
+    load_llm_picks,
     load_log,
     load_news_log,
     load_queue,
@@ -39,6 +43,8 @@ from store import (
     mark_failed,
     mark_sent,
     merge_into_live,
+    save_extracted,
+    save_llm_picks,
     save_settings,
 )
 
@@ -47,6 +53,9 @@ app = Flask(__name__)
 WHATSAPP_CONFIG_FILE = "selfhosted_config.json"
 POLL_INTERVAL_SECONDS = 10 * 60  # how often the poller checks for fresh news
 SEND_PACE_SECONDS = (15, 20)  # gap between consecutive auto-sends when several land at once
+
+_poll_lock = threading.Lock()
+_poll_running = False
 
 
 def collect_articles(keyword, date_from, date_to, category_filter=None):
@@ -66,16 +75,47 @@ def collect_articles(keyword, date_from, date_to, category_filter=None):
 
 
 def fresh_date_range():
+    """Return TODAY ONLY for 'fresh news' mode - strictly today's news."""
     today = datetime.now()
-    yesterday = today - timedelta(days=1)
-    return yesterday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+    return today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+def is_today_news(article_date_str):
+    """Check if article is from today. Returns True only for today's date."""
+    if not article_date_str:
+        return False
+    try:
+        article_date = datetime.strptime(article_date_str, "%Y-%m-%d").date()
+        today = datetime.now().date()
+        return article_date == today
+    except (ValueError, AttributeError):
+        return False
 
 
 def run_poll_cycle():
-    """Fetch, dedupe, and merge today's news; log and queue anything new."""
+    """Fetch candidates, let the LLM pick awards, then merge into Live."""
     date_from, date_to = fresh_date_range()
-    deduped = fetch_and_dedup_sync(None, date_from, date_to)
-    articles = finalize_articles(deduped, date_from, date_to)
+    raw = fetch_candidates_sync(None, date_from, date_to)
+    extracted = finalize_articles(raw, date_from, date_to)
+    save_extracted(extracted)
+
+    to_judge = [{**item, "cat": item.get("category")} for item in extracted]
+    kept, evaluations = judge_award_articles(to_judge)
+    save_llm_picks(evaluations)
+
+    kept_by_id = {item.get("id"): item for item in kept}
+    articles = []
+    for item in extracted:
+        chosen = kept_by_id.get(item["id"])
+        if not chosen:
+            continue
+        if not is_today_news(item.get("date", "")):
+            continue
+        category = chosen.get("cat") or chosen.get("category")
+        if category not in AWARD_CATEGORIES:
+            continue
+        articles.append({**item, "category": category, "llm_approved": True})
+
     live, newly_added = merge_into_live(articles)
     if newly_added:
         log_discovered(newly_added)
@@ -83,11 +123,37 @@ def run_poll_cycle():
     return live, newly_added
 
 
+def kick_poll():
+    """Start an RSS + LLM cycle in the background. Never blocks the UI."""
+    global _poll_running
+    with _poll_lock:
+        if _poll_running:
+            return False
+        _poll_running = True
+
+    def _run():
+        global _poll_running
+        try:
+            run_poll_cycle()
+        except Exception as exc:
+            print(f"Poller: {exc}", flush=True)
+        finally:
+            with _poll_lock:
+                _poll_running = False
+
+    threading.Thread(target=_run, name="news-poll-once", daemon=True).start()
+    return True
+
+
+def poll_is_running():
+    with _poll_lock:
+        return _poll_running
+
+
 def refresh_live_feed(force=False):
-    if not force:
-        return load_live(), 0
-    live, newly_added = run_poll_cycle()
-    return live, len(newly_added)
+    if force:
+        kick_poll()
+    return load_live(), 0
 
 
 def load_whatsapp_config():
@@ -129,6 +195,34 @@ def send_article_to_group(article):
         if not bot_ready(bot_api_url):
             raise RuntimeError("WhatsApp bot is not ready. Start node whatsapp_selfhosted.js")
 
+        # STRICT: Only send TODAY's award news
+        article_date = article.get("date", "")
+        if not is_today_news(article_date):
+            print(f"Skipping old news (date: {article_date}): {article.get('title', '')[:50]}")
+            return None, "not_today"
+
+        if not article.get("llm_approved"):
+            judged, _evals = judge_award_articles([{
+                "title": article.get("title", ""),
+                "source": article.get("source", ""),
+                "link": article.get("link", ""),
+                "cat": article.get("category") or article.get("cat"),
+            }])
+            if not judged:
+                print(f"LLM rejected before send: {article.get('title', '')[:50]}", flush=True)
+                return None, "not_award"
+            article = {**article, "category": judged[0]["cat"], "llm_approved": True}
+
+        if article.get("category") not in AWARD_CATEGORIES:
+            print(f"Skipping non-award news: {article.get('title', '')[:50]}")
+            return None, "not_award"
+
+        # Check if already sent (first check)
+        sent_ids = load_sent_ids()
+        if aid in sent_ids:
+            return None, "already_sent"
+
+        # Double-check right before sending to prevent race conditions
         sent_ids = load_sent_ids()
         if aid in sent_ids:
             return None, "already_sent"
@@ -184,9 +278,9 @@ def poller_loop():
     time.sleep(8)
     while True:
         try:
-            run_poll_cycle()
+            kick_poll()
         except Exception as exc:
-            print(f"Poller: {exc}")
+            print(f"Poller: {exc}", flush=True)
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -224,6 +318,8 @@ def index():
             category_filter = "Contract Awarded"
         elif category == "project":
             category_filter = "Project Awarded"
+        elif category == "general":
+            category_filter = "General Construction"
 
         results, from_cache = collect_articles(keyword, date_from, date_to, category_filter)
 
@@ -257,6 +353,12 @@ def api_live():
     articles = []
     for article in live.get("articles", []):
         aid = article.get("id") or article_id(article["title"], article["link"])
+        if not article.get("llm_approved"):
+            continue
+        if article.get("category") not in AWARD_CATEGORIES:
+            continue
+        if not is_today_news(article.get("date", "")):
+            continue
         status = "sent" if aid in sent_ids else "waiting"
         articles.append({**article, "id": aid, "status": status})
 
@@ -266,9 +368,22 @@ def api_live():
         "fetched_at": live.get("fetched_at"),
         "articles": articles,
         "queued_new": queued_new,
+        "polling": poll_is_running(),
         "queue": queue_payload(),
         "log": load_log(200),
     })
+
+
+@app.route("/api/extracted")
+def api_extracted():
+    data = load_extracted()
+    return jsonify({"success": True, **data})
+
+
+@app.route("/api/llm-picks")
+def api_llm_picks():
+    data = load_llm_picks()
+    return jsonify({"success": True, **data})
 
 
 @app.route("/api/log")
@@ -437,6 +552,8 @@ def send_to_whatsapp():
 
 
 if __name__ == "__main__":
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
-        start_background_loops()
-    app.run(debug=True, port=5050, threaded=True)
+    # Start background loops once
+    start_background_loops()
+    # Run with debug=False to prevent auto-reload creating multiple processes
+    # Use use_reloader=False to ensure only one process
+    app.run(debug=False, port=5050, threaded=True, use_reloader=False)

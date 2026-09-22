@@ -1,30 +1,53 @@
-# Construction News App - UAE & Saudi Arabia
+# Construction News Monitor - UAE & Saudi Arabia
 
-Automated construction news aggregator that fetches, classifies, and posts news from 38 trusted sources to WhatsApp - continuously, the moment a new non-duplicate story is confirmed.
+**Production-ready** news monitoring system for **Project Awarded** and **Contract Awarded** construction news from UAE and Saudi Arabia. Features strict LLM filtering, automated WhatsApp delivery, and comprehensive monitoring UI.
+
+---
 
 ## 📁 Project Structure
 
 ```
 NEWSAPP/
-├── app.py                      # Flask web application (main interface)
-├── pipeline.py                 # News fetching & classification logic
-├── sources.py                  # Source configuration (38 publishers)
-├── whatsapp_selfhosted.js      # Self-hosted WhatsApp bot (Node.js)
-├── alerter_selfhosted.py       # Manual one-shot fallback (auto-posting lives in app.py)
-├── selfhosted_config.json      # WhatsApp group configuration
-├── sent_whatsapp.json          # Tracks sent articles (auto-generated)
-├── settings.json                # Auto-send on/off toggle (auto-generated)
-├── news_log.json                # Discovery history - everything found so far (auto-generated)
-├── requirements.txt            # Python dependencies
-├── package.json                # Node.js dependencies
-├── .gitignore                  # Git ignore rules
-├── templates/
-│   └── index.html              # Web UI template
-├── cache/                      # Search results cache (auto-generated)
-└── .whatsapp-session-new/      # WhatsApp session data (auto-generated)
+├── 📄 Core Application
+│   ├── app.py                      # Flask web server & background automation
+│   ├── pipeline.py                 # News fetching & keyword filtering
+│   ├── llm_judge.py                # LLM-based strict filtering
+│   ├── store.py                    # Data persistence layer
+│   └── sources.py                  # 38 trusted publishers + keywords
+│
+├── 📱 WhatsApp Integration
+│   ├── whatsapp_selfhosted.js      # Self-hosted bot (Node.js + Puppeteer)
+│   └── selfhosted_config.json      # Group configuration (not in git)
+│
+├── ⚙️ Configuration
+│   ├── requirements.txt            # Python dependencies
+│   ├── package.json                # Node.js dependencies
+│   ├── .env                        # API keys (not in git)
+│   └── .gitignore                  # Git ignore rules
+│
+├── 🖥️ User Interface
+│   └── templates/index.html        # Complete monitoring dashboard
+│
+└── 📊 Generated Data (not in git)
+    ├── extracted_news.json         # After keyword filter
+    ├── llm_picks.json              # LLM evaluation results
+    ├── live_news.json              # Today's approved news
+    ├── send_queue.json             # WhatsApp queue
+    ├── whatsapp_log.json           # Send history
+    ├── news_log.json               # Discovery history
+    ├── sent_whatsapp.json          # Deduplication tracker
+    └── cache/                      # Search cache (30min)
 ```
 
+---
+
 ## 🚀 Quick Start
+
+### Prerequisites
+- Python 3.9+
+- Node.js 16+
+- Spare WhatsApp number (not your main account)
+- OpenAI or Gemini API key
 
 ### 1. Install Dependencies
 
@@ -41,9 +64,18 @@ npm install
 npx puppeteer browsers install chrome
 ```
 
-### 2. Configure WhatsApp
+### 2. Configure API Keys
 
-Update `selfhosted_config.json` with your group ID:
+Create `.env` file in project root:
+```env
+OPENAI_API_KEY=sk-proj-your-key-here
+# OR
+GEMINI_API_KEY=your-gemini-key-here
+```
+
+### 3. Configure WhatsApp
+
+Update `selfhosted_config.json`:
 ```json
 {
   "groupId": "YOUR_GROUP_ID@g.us",
@@ -51,233 +83,318 @@ Update `selfhosted_config.json` with your group ID:
 }
 ```
 
-### 3. Start Services
+**How to get Group ID:**
+1. Get the WhatsApp invite link from your phone
+2. Start the bot: `node whatsapp_selfhosted.js`
+3. Use the bot's `/groups` endpoint or convert the invite link
+
+### 4. Start Services
 
 **Terminal 1 - WhatsApp Bot:**
 ```bash
 node whatsapp_selfhosted.js
-# Scan QR code with spare WhatsApp number
+# Scan QR code with your spare WhatsApp number
+# Wait for "WhatsApp bot ready!"
 ```
 
 **Terminal 2 - Web App:**
 ```bash
 python app.py
-# Open http://127.0.0.1:5050
+# Open http://localhost:5050
 ```
 
-## 📊 Features
+---
 
-### Web Interface (http://127.0.0.1:5050)
-- ✅ Search 38 sources in parallel (~15 seconds)
-- ✅ Smart deduplication (same news only once, even across different publishers)
-- ✅ Date range filtering
-- ✅ Category filtering (Contract/Project Awarded)
-- ✅ Live search within results
-- ✅ Sort by date, source, category
-- ✅ Export to CSV
-- ✅ **One-click auto-send toggle** - on posts automatically, off means nothing sends until you do it manually
-- ✅ **News Log** - everything discovered so far, sent or not
-- ✅ Dark mode
-- ✅ Mobile responsive
+## 🎯 How It Works
 
-### News Classification
-- **Categories**: Contract Awarded, Project Awarded
-- **Countries**: UAE, Saudi Arabia
-- **Industries**: Construction, infrastructure, development
-- **Accuracy**: ~89% with 25-40 results per search
+### Complete News Flow
 
-### WhatsApp Integration
-- ✅ Self-hosted (no third-party access)
-- ✅ Duplicate prevention
-- ✅ Posts as soon as a new story is confirmed; ~15-20s gap between messages when several land at once (spam protection)
-- ✅ Formatted messages with category, country, title, source, link
-- ✅ Tracks sent articles to avoid re-posting
-
-## 📚 Core Files Explained
-
-### `app.py` - Web Application
-- Flask web server
-- Handles search requests, renders results
-- A background poller checks for fresh news continuously (every 10 minutes) and a background sender posts anything new the instant it's confirmed unique, whenever the auto-send toggle is on
-- WhatsApp integration endpoints
-
-### `pipeline.py` - Core Logic
-- Fetches news from Google News RSS
-- Parallel async requests
-- Classifies by category and country
-- Caches results (30 minutes, manual Search only)
-- Shared cross-source deduplication logic, used by both Search and the Live poller
-
-### `sources.py` - Configuration
-- 38 trusted publishers
-- Award keywords (wins, secured, awarded, etc.)
-- Construction keywords (building, infrastructure, etc.)
-- Country keywords (Dubai, Riyadh, NEOM, etc.)
-
-### `whatsapp_selfhosted.js` - WhatsApp Bot
-- Express.js API server (port 3000)
-- WhatsApp Web automation via Puppeteer
-- Endpoints: `/status`, `/groups`, `/send`
-- Session management
-
-### `alerter_selfhosted.py` - Manual Fallback (Optional)
-- One-shot check you can run by hand (`python alerter_selfhosted.py [--dry-run]`)
-- `app.py` is now the continuous auto-poster, so `--watch` here is deprecated - running it alongside `app.py` would double-post
-
-## 🎯 Daily Usage
-
-1. Open http://127.0.0.1:5050 and start `node whatsapp_selfhosted.js` in another terminal
-2. Go to the **Live** tab and flip **Auto-send** on - fresh, non-duplicate news then posts to WhatsApp automatically, paced ~15-20s apart when several stories land at once
-3. Use the **News Log** tab to see everything that's been discovered so far, and the **Send Log** tab to see what actually went to WhatsApp
-4. Use **Search** any time for a manual lookup, and "Queue for WhatsApp" / "Post this" to send something by hand regardless of the toggle
-
-### One-shot manual check (optional)
-```bash
-python alerter_selfhosted.py --dry-run
-# Prints what it would send, without posting
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. FETCH FROM SOURCES (38 publishers, Google News RSS)         │
+│     ↓ Pipeline fetches in parallel (~15 seconds)                │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  2. KEYWORD FILTER (Extracted Tab)                              │
+│     • Award keywords: "awarded", "wins", "secured", etc.        │
+│     • Construction keywords: "construction", "building", etc.   │
+│     • Country keywords: "Dubai", "Riyadh", "NEOM", etc.         │
+│     → Saved to extracted_news.json                              │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  3. LLM EVALUATION (LLM Picked Tab)                             │
+│     ✓ GPT-4o-mini or Gemini judges each headline               │
+│     ✓ Strict rules:                                             │
+│       - Must be construction/infrastructure/EPC/building        │
+│       - Contract awarded/signed OR project awarded              │
+│       - UAE or Saudi Arabia                                     │
+│       - NOT tech, AI, software, IT deals                        │
+│       - NOT statistics, market commentary                       │
+│       - NOT "exploring" or "in talks"                           │
+│     → Saved to llm_picks.json with keep/drop reasons            │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  4. LIVE FEED (Live Tab)                                        │
+│     • Only LLM-approved articles                                │
+│     • Only today's date                                         │
+│     • Only "Contract Awarded" / "Project Awarded"               │
+│     → Merged into live_news.json                                │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  5. WHATSAPP QUEUE                                              │
+│     • New articles added to send_queue.json                     │
+│     • Hourly sending (1 post per hour, no spam)                 │
+│     • Double-check: LLM re-validates before sending             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  6. SEND LOG (Send Log Tab)                                     │
+│     • Complete history: sent or failed                          │
+│     • Tracking: source, title, date, status, group ID           │
+│     → Saved to whatsapp_log.json                                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 🔧 Configuration
+### Background Automation
+
+- **Poller**: Checks for fresh news every 10 minutes
+- **Sender**: Sends 1 article per hour from the queue
+- **LLM**: Re-validates every article before sending (extra safety)
+
+---
+
+## 📊 Web Interface Tabs
+
+### 1. **Search Tab**
+- Manual search across all 38 sources
+- Date range, keyword filtering
+- Live client-side search, sorting
+- Export to CSV
+- "Queue for WhatsApp" button
+
+### 2. **Extracted Tab** 🆕
+- Shows all headlines after Google News + keyword filter
+- **Before LLM judgment**
+- Helps understand what the pipeline found
+- Refresh button to re-fetch
+
+### 3. **LLM Picked Tab** 🆕
+- Shows LLM's decision for each extracted headline
+- **Keep** ✓ or **Drop** ✗ with reasons
+- Filter: Show All / Keep Only / Drop Only
+- Transparency into LLM's thinking
+
+### 4. **Live Tab**
+- Today's approved news (LLM-filtered)
+- Auto-refresh every 30 seconds
+- "Post next" button for manual send
+- Shows next scheduled send time
+- Countdown timer
+
+### 5. **News Log Tab**
+- Complete discovery history
+- All news found, sent or not
+- Date, source, category tracking
+
+### 6. **Send Log Tab**
+- WhatsApp send history
+- Status: ✓ Sent or ✗ Failed
+- Source, date, group ID
+- Error messages if failed
+
+### 7. **Connect WhatsApp Tab**
+- Bot connection status
+- Group list
+- QR code for re-linking
+
+---
+
+## 🎓 Key Features
+
+### ✅ Strict LLM Filtering
+- **No false positives**: LLM eliminates unrelated news
+- **Category accuracy**: "Contract Awarded" vs "Project Awarded"
+- **Construction-only**: Rejects tech, AI, software deals
+- **Transparency**: See exactly why each article was kept/dropped
+
+### ✅ Smart Sending
+- **Hourly limit**: 1 post per hour (no spam)
+- **Double-check**: LLM re-validates before sending
+- **Date validation**: Only today's news
+- **Deduplication**: No duplicate titles or hashes
+
+### ✅ Self-Hosted WhatsApp
+- **No third-party access**: Your data stays private
+- **No API keys**: Uses WhatsApp Web automation
+- **No ban risk**: Uses spare SIM with normal pacing
+- **Session persistence**: Re-links automatically on errors
+
+### ✅ Production-Ready
+- **Clean codebase**: Unnecessary files removed
+- **Error handling**: Graceful failures, logging
+- **Thread-safe**: Locks prevent race conditions
+- **Git-ready**: Sensitive files in .gitignore
+
+---
+
+## 🌐 Sources (38 Publishers)
+
+### Construction Publications
+Zawya, MEED, Construction Week Online
+
+### UAE News
+Khaleej Times, Gulf News, The National, Emirates 24/7
+
+### Saudi News
+Arab News, Saudi Gazette, Okaz, Al Riyadh
+
+### Business
+Arabian Business, Gulf Business, Trade Arabia
+
+### Official
+WAM (UAE), SPA (Saudi Arabia)
+
+**Full list in `sources.py`**
+
+---
+
+## 🔧 Configuration Files
 
 ### `selfhosted_config.json`
 ```json
 {
-  "groupId": "YOUR_GROUP_ID@g.us",
-  "botApiUrl": "http://localhost:3000"   # Local bot API
+  "groupId": "120363123456789@g.us",
+  "botApiUrl": "http://localhost:3000"
 }
 ```
 
+### `.env`
+```env
+OPENAI_API_KEY=sk-proj-...
+OPENAI_MODEL=gpt-4o-mini
+# OR
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.0-flash
+```
+
 ### `.gitignore`
-Ensures sensitive data is not committed:
-- `.whatsapp-session*/` - WhatsApp session data
-- `sent_whatsapp.json` - Sent articles tracking
-- `selfhosted_config.json` - WhatsApp configuration
-- `cache/` - Search cache
-- `.venv/` - Python virtual environment
+Automatically excludes:
+- WhatsApp session files
+- API keys (.env)
+- Generated data (JSON logs)
+- Configuration (selfhosted_config.json)
+- Cache and dependencies
 
-## 🌐 Sources (38)
-
-### Major Construction Publications
-- Zawya, MEED, Construction Week Online
-
-### UAE News
-- Khaleej Times, Gulf News, The National, Emirates 24/7
-
-### Saudi Arabia News
-- Arab News, Saudi Gazette, Okaz, Al Riyadh
-
-### Business & Trade
-- Arabian Business, Gulf Business, Trade Arabia
-
-### Official Agencies
-- WAM (UAE), SPA (Saudi Arabia)
-
-[See `sources.py` for complete list]
-
-## 🛡️ Safety Features
-
-### WhatsApp Bot Safety
-- ✅ Self-hosted (no third-party access)
-- ✅ Uses spare SIM (protects main account)
-- ✅ ~15-20s pacing between consecutive auto-sends (spam protection)
-- ✅ Duplicate prevention
-- ✅ One toggle to stop all auto-posting instantly if needed
-
-### Data Privacy
-- ✅ All data stored locally
-- ✅ No external API calls (except Google News RSS)
-- ✅ Session data encrypted by WhatsApp
-
-## 📝 Notes
-
-### Google News RSS Limitations
-- Results typically from last 30 days
-- Historical searches beyond 30 days have limited coverage
-- Best results: Leave dates empty for today's news
-
-### Deduplication
-- Same news from different sources appears only once
-- Keeps version from the most trusted source (order in `sources.py`)
-- 85% word similarity threshold
-- Runs identically for manual Search and the automatic Live poller (shared logic in `pipeline.py`)
-
-### Performance
-- First search: ~15-20 seconds (76 parallel requests)
-- Cached searches: Instant (30-minute cache)
-- Live poller: checks for fresh news every 10 minutes
-- WhatsApp posting: ~15-20 seconds between consecutive auto-sends
+---
 
 ## 🐛 Troubleshooting
 
-### WhatsApp Bot Not Connecting
+### LLM Not Working
 ```bash
-# Reinstall Chrome for Puppeteer
+# Check API key in .env
+cat .env
+# Test manually
+curl https://api.openai.com/v1/models -H "Authorization: Bearer YOUR_KEY"
+```
+
+### WhatsApp Bot Errors
+```bash
+# Reinstall Chrome
 npx puppeteer browsers install chrome
 
-# Restart bot
+# Clear session and restart
+rm -rf .wwebjs_cache
 node whatsapp_selfhosted.js
 ```
 
-### Port Already in Use
+### Flask App Not Responding
 ```bash
-# Kill processes
-taskkill /F /IM node.exe
+# Kill all Python processes
 taskkill /F /IM python.exe
+
+# Restart app
+python app.py
 ```
 
-### Cache Issues
-```bash
-# Clear cache for fresh results
-Remove-Item cache\*.json
-```
+### No News Showing
+- **Morning/Weekend**: RSS feeds update slowly
+- **Default range**: App shows yesterday + today
+- **LLM rejection**: Check "LLM Picked" tab for reasons
+
+---
+
+## 📝 Daily Workflow
+
+1. **Morning**: Open http://localhost:5050
+2. **Check "Live" tab**: See today's approved news
+3. **Check "LLM Picked" tab**: Review what was filtered
+4. **Check "Send Log" tab**: Verify WhatsApp posts
+5. **Manual search**: Use "Search" tab for specific queries
+6. **Monitor**: Background runs automatically
+
+---
+
+## 🛡️ Security & Privacy
+
+✅ **All data stored locally** (no cloud services)  
+✅ **Self-hosted WhatsApp** (no third-party APIs)  
+✅ **Sensitive files in .gitignore** (safe for GitHub)  
+✅ **API keys in .env** (never committed)  
+✅ **Session files protected** (WhatsApp encryption)  
+
+---
 
 ## 📦 Dependencies
 
 ### Python
-- flask - Web framework
-- feedparser - RSS parsing
-- aiohttp - Async HTTP requests
-- requests - HTTP client
+- `flask` - Web framework
+- `feedparser` - RSS parsing
+- `aiohttp` - Async HTTP
+- `requests` - HTTP client
 
 ### Node.js
-- whatsapp-web.js - WhatsApp automation
-- puppeteer - Browser automation
-- express - API server
-- qrcode-terminal - QR code display
-
-## 🎓 Understanding the Workflow
-
-Automatic (continuous, once auto-send is on):
-```
-1. BACKGROUND POLLER (app.py, every 10 min)
-   ↓
-2. PIPELINE (pipeline.py)
-   ├─ Fetch from 38 sources (parallel)
-   ├─ Classify articles
-   ├─ Deduplicate (same story across publishers -> one entry)
-   └─ Return results
-   ↓
-3. MERGE into today's live feed + NEWS LOG (everything discovered)
-   ↓
-4. Genuinely new items → SEND QUEUE
-   ↓
-5. BACKGROUND SENDER (app.py, ticks every 5s)
-   ├─ Only sends if the auto-send toggle is on
-   ├─ Paces consecutive sends ~15-20s apart
-   └─ WhatsApp Bot (whatsapp_selfhosted.js) posts to the group, tracks sent articles
-```
-
-Manual (any time, toggle or no toggle):
-```
-1. USER SEARCHES or clicks "Post this" on a Live-tab item
-   ↓
-2. FLASK (app.py) → WhatsApp Bot API → posted immediately
-```
-
-## 📄 License
-
-Private project for internal use.
+- `whatsapp-web.js` - WhatsApp automation
+- `puppeteer` - Headless Chrome
+- `express` - API server
+- `qrcode-terminal` - QR display
 
 ---
 
-**Made with ❤️ for construction news aggregation**
+## 🎯 Production Deployment
+
+### Option 1: Local PC (Recommended for testing)
+```bash
+# Already running - just keep terminals open
+```
+
+### Option 2: VPS (Ubuntu/Debian)
+```bash
+# Install PM2 for process management
+npm install -g pm2
+
+# Create PM2 config (ecosystem.config.js)
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup
+```
+
+### Option 3: Windows Server
+```bash
+# Run as Windows Service using NSSM
+nssm install NewsAppFlask python app.py
+nssm install NewsAppWhatsApp node whatsapp_selfhosted.js
+```
+
+---
+
+## 📄 License
+
+Private project for internal construction news monitoring.
+
+---
+
+**Built for strict construction news filtering with LLM intelligence** 🏗️

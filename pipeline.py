@@ -13,6 +13,7 @@ import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from sources import COUNTRY_KEYWORDS, TRUSTED_PUBLISHERS, CONSTRUCTION_KEYWORDS
 from store import article_id
+from llm_judge import AWARD_CATEGORIES, judge_award_articles
 
 # Cache settings
 CACHE_DIR = "cache"
@@ -97,10 +98,23 @@ def build_search_url(publisher_domain, country, keyword=None, date_from=None, da
     return f"https://news.google.com/rss/search?q={quote(query)}&hl=en&gl={gl}&ceid={ceid}"
 
 
-def classify_category(title):
+def matches_construction(title):
     """
-    Classify articles with MORE LENIENT matching to catch more news.
-    Target: Capture as much relevant news as possible (30-50 results).
+    Check if the title matches construction keywords.
+    Returns True if any construction keyword is found.
+    """
+    title_lower = title.lower()
+    for kw in CONSTRUCTION_KEYWORDS:
+        if kw.lower() in title_lower:
+            return True
+    return False
+
+
+def classify_category(title):
+    """Cheap first-pass tag. Returns an award category or None.
+
+    This is not the final gate. fetch_and_dedup() still runs judge_award_articles()
+    so listings, permits stats, and unrelated deals do not get through.
     """
     title_lower = title.lower()
     
@@ -298,20 +312,20 @@ async def fetch_all_feeds_parallel(keyword=None, date_from=None, date_to=None):
 
 
 def dedup_articles(feed_results, category_filter=None):
-    """Classify and cross-source-dedupe raw feed entries.
+    """Keep construction + UAE/Saudi headlines, then cross-source-dedupe.
 
-    feed_results: list of (publisher, country, raw_entries) as returned by
-    fetch_all_feeds_parallel. Returns a list of dicts (title, link, source,
-    cat, country, published) - no id, no date-range filtering; callers
-    handle those via finalize_articles.
+    Category is a keyword hint only. The LLM (or keyword fallback) in
+    fetch_and_dedup() is what decides Contract vs Project vs drop.
     """
     seen_articles = {}
     for publisher, _country, articles in feed_results:
         for a in articles:
+            if not matches_construction(a.title):
+                continue
+
             cat = classify_category(a.title)
             country_tag = classify_country(a.title)
-
-            if cat is None or country_tag is None:
+            if country_tag is None:
                 continue
             if category_filter and cat != category_filter:
                 continue
@@ -403,7 +417,24 @@ def finalize_articles(deduped, date_from=None, date_to=None):
 
 async def fetch_and_dedup(keyword=None, date_from=None, date_to=None, category_filter=None):
     feed_results = await fetch_all_feeds_parallel(keyword, date_from, date_to)
-    return dedup_articles(feed_results, category_filter)
+    # Do not apply category_filter here: the LLM may upgrade a weakly tagged
+    # headline into Contract/Project Awarded. Filter after the judge.
+    articles = dedup_articles(feed_results)
+    kept, _evaluations = judge_award_articles(articles)
+    if category_filter:
+        kept = [a for a in kept if a.get("cat") == category_filter]
+    return kept
+
+
+def fetch_candidates_sync(keyword=None, date_from=None, date_to=None):
+    """Fetch and keyword-filter only. Does not run the LLM."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        feed_results = loop.run_until_complete(fetch_all_feeds_parallel(keyword, date_from, date_to))
+        return dedup_articles(feed_results)
+    finally:
+        loop.close()
 
 
 def fetch_and_dedup_sync(keyword=None, date_from=None, date_to=None, category_filter=None):

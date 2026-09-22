@@ -25,6 +25,8 @@
     --contract-soft: #fbebde;
     --project: #0f766e;
     --project-soft: #e1f3f0;
+    --general: #6b7280;
+    --general-soft: #f3f4f6;
 
     --radius-lg: 16px;
     --radius-md: 12px;
@@ -250,6 +252,7 @@
   .stat-icon.brand { background: var(--brand-soft); color: var(--brand); }
   .stat-icon.contract { background: var(--contract-soft); color: var(--contract); }
   .stat-icon.project { background: var(--project-soft); color: var(--project); }
+  .stat-icon.general { background: var(--general-soft); color: var(--general); }
   .stat-icon.neutral { background: #eef0f4; color: var(--muted); }
   [data-theme="dark"] .stat-icon.neutral { background: #252937; }
   .stat-value { font-size: 21px; font-weight: 800; line-height: 1.1; letter-spacing: -0.01em; }
@@ -276,6 +279,7 @@
   .section-icon svg { width: 13px; height: 13px; }
   .section-icon.contract { background: var(--contract-soft); color: var(--contract); }
   .section-icon.project { background: var(--project-soft); color: var(--project); }
+  .section-icon.general { background: var(--general-soft); color: var(--general); }
   .section-head h2 { font-size: 14.5px; font-weight: 700; margin: 0; }
   .section-count {
     margin-left: auto; font-size: 12px; font-weight: 700; color: var(--muted);
@@ -298,6 +302,7 @@
   }
   .card.contract { border-left-color: var(--contract); }
   .card.project { border-left-color: var(--project); }
+  .card.general { border-left-color: var(--general); }
   .card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
   .card-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .badge {
@@ -306,6 +311,7 @@
   }
   .badge.contract { background: var(--contract-soft); color: var(--contract); }
   .badge.project { background: var(--project-soft); color: var(--project); }
+  .badge.general { background: var(--general-soft); color: var(--general); }
   .badge.country { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
   .card a.title {
     color: var(--text); text-decoration: none; font-size: 14.5px; font-weight: 600;
@@ -484,6 +490,8 @@
 
   <div class="tabs" role="tablist">
     <button type="button" class="tab-btn active" data-tab="search">Search</button>
+    <button type="button" class="tab-btn" data-tab="extracted">Extracted</button>
+    <button type="button" class="tab-btn" data-tab="llmpicks">LLM Picked</button>
     <button type="button" class="tab-btn" data-tab="live">Live</button>
     <button type="button" class="tab-btn" data-tab="newslog">News Log</button>
     <button type="button" class="tab-btn" data-tab="log">Send Log</button>
@@ -518,9 +526,10 @@
       <div class="input-wrap select-wrap">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg>
         <select name="category">
-          <option value="both" {% if form_values.category == "both" %}selected{% endif %}>Both</option>
+          <option value="both" {% if form_values.category == "both" %}selected{% endif %}>All Categories</option>
           <option value="contract" {% if form_values.category == "contract" %}selected{% endif %}>Contract Awarded</option>
           <option value="project" {% if form_values.category == "project" %}selected{% endif %}>Project Awarded</option>
+          <option value="general" {% if form_values.category == "general" %}selected{% endif %}>General Construction</option>
         </select>
       </div>
     </div>
@@ -570,6 +579,7 @@
 
     {% set contract_items = results|selectattr("category", "equalto", "Contract Awarded")|list %}
     {% set project_items = results|selectattr("category", "equalto", "Project Awarded")|list %}
+    {% set general_items = results|selectattr("category", "equalto", "General Construction")|list %}
     {% set countries = results|map(attribute="country")|unique|list %}
 
     <div class="summary">
@@ -627,9 +637,15 @@
       <div class="empty">Nothing matched. Try widening the date range or clearing the keyword.</div>
     {% else %}
       <div id="resultsContainer">
-        {% for category in ["Contract Awarded", "Project Awarded"] %}
+        {% for category in ["Contract Awarded", "Project Awarded", "General Construction"] %}
           {% set cat_items = results|selectattr("category", "equalto", category)|list %}
-          {% set dot_class = "contract" if category == "Contract Awarded" else "project" %}
+          {% if category == "Contract Awarded" %}
+            {% set dot_class = "contract" %}
+          {% elif category == "Project Awarded" %}
+            {% set dot_class = "project" %}
+          {% else %}
+            {% set dot_class = "general" %}
+          {% endif %}
           <div class="section-head" data-category="{{ category }}">
             <span class="section-icon {{ dot_class }}">
               {% if dot_class == "contract" %}
@@ -675,6 +691,68 @@
       </div>
     {% endif %}
   {% endif %}
+  </div>
+
+  <div class="tab-panel" id="tab-extracted">
+    <div class="live-bar">
+      <div>
+        <h2>Extracted news</h2>
+        <p id="extractedMeta">Headlines after Google News + keyword filter, before the LLM decides.</p>
+      </div>
+      <div class="live-actions">
+        <button type="button" class="ghost-btn" id="refreshExtractedBtn">Refresh</button>
+      </div>
+    </div>
+    <div class="panel log-panel">
+      <div class="table-wrap">
+        <table class="log-table" id="extractedTable">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>News</th>
+              <th>Country</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody id="extractedTableBody">
+            <tr><td colspan="4" class="empty-cell">Open this tab after a live fetch.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-llmpicks">
+    <div class="live-bar">
+      <div>
+        <h2>LLM picked</h2>
+        <p id="llmMeta">How the model kept or dropped each extracted headline.</p>
+      </div>
+      <div class="live-actions">
+        <button type="button" class="ghost-btn" data-llm-filter="all">All</button>
+        <button type="button" class="ghost-btn" data-llm-filter="kept">Kept</button>
+        <button type="button" class="ghost-btn" data-llm-filter="dropped">Dropped</button>
+        <button type="button" class="ghost-btn" id="refreshLlmBtn">Refresh</button>
+      </div>
+    </div>
+    <div class="panel log-panel">
+      <div class="table-wrap">
+        <table class="log-table" id="llmTable">
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>News</th>
+              <th>Category</th>
+              <th>Why</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="llmTableBody">
+            <tr><td colspan="5" class="empty-cell">Open this tab after a live fetch.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <div class="tab-panel" id="tab-live">
@@ -835,7 +913,7 @@
       panel.classList.toggle('active', panel.id === `tab-${name}`);
     });
     if (name === 'live') {
-      loadLive();
+      loadLive(false);
       startLiveAutoRefresh();
     } else {
       stopLiveAutoRefresh();
@@ -847,6 +925,8 @@
     }
     if (name === 'newslog') loadNewsLog();
     if (name === 'log') loadLog();
+    if (name === 'extracted') loadExtracted();
+    if (name === 'llmpicks') loadLlmPicks();
     history.replaceState(null, '', name === 'search' ? '#' : `#${name}`);
   }
 
@@ -896,8 +976,11 @@
     document.getElementById('liveCount').textContent = articles.length;
     const autoOn = !!(data.queue && data.queue.auto_send_enabled);
     setAutoToggle(autoOn);
+    const waiting = data.queue?.count || 0;
+    const updated = data.fetched_at || 'just now';
+    const aiStatus = data.polling ? ' AI is checking new headlines now.' : '';
     document.getElementById('liveMeta').textContent =
-      `Updated ${data.fetched_at || 'just now'}. ${data.queue?.count || 0} waiting. ` +
+      `Updated ${updated}. ${waiting} waiting.` + aiStatus + ' ' +
       (autoOn ? 'Auto-send is on — new stories post automatically.' : 'Auto-send is off — nothing posts until you turn it on or post manually.');
 
     if (!articles.length) {
@@ -991,10 +1074,80 @@
     }
   }
 
+  async function loadExtracted() {
+    const body = document.getElementById('extractedTableBody');
+    const meta = document.getElementById('extractedMeta');
+    body.innerHTML = '<tr><td colspan="4" class="empty-cell">Loading extracted news…</td></tr>';
+    try {
+      const response = await fetch('/api/extracted');
+      const data = await response.json();
+      const articles = data.articles || [];
+      meta.textContent = `${articles.length} headline(s) extracted${data.fetched_at ? ' · ' + data.fetched_at : ''}. LLM has not filtered this list yet.`;
+      if (!articles.length) {
+        body.innerHTML = '<tr><td colspan="4" class="empty-cell">Nothing extracted yet. Click Refresh live to fetch.</td></tr>';
+        return;
+      }
+      body.innerHTML = articles.map(item => `
+        <tr>
+          <td>${escapeHtml(item.source || '-')}</td>
+          <td class="news"><a class="title" href="${escapeHtml(item.link || '#')}" target="_blank">${escapeHtml(item.title || '-')}</a></td>
+          <td>${escapeHtml(item.country || '-')}</td>
+          <td>${escapeHtml(item.date || '-')}</td>
+        </tr>
+      `).join('');
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="4" class="empty-cell">Could not load extracted news: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  let llmFilter = 'all';
+  let llmItems = [];
+
+  function renderLlmPicks(items) {
+    const body = document.getElementById('llmTableBody');
+    const filtered = items.filter(item => {
+      if (llmFilter === 'kept') return item.keep;
+      if (llmFilter === 'dropped') return !item.keep;
+      return true;
+    });
+    if (!filtered.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty-cell">No rows for this filter.</td></tr>';
+      return;
+    }
+    body.innerHTML = filtered.map(item => `
+      <tr>
+        <td><span class="status-pill ${item.keep ? 'sent' : 'failed'}">${item.keep ? 'kept' : 'dropped'}</span></td>
+        <td class="news"><a class="title" href="${escapeHtml(item.link || '#')}" target="_blank">${escapeHtml(item.title || '-')}</a></td>
+        <td>${escapeHtml(item.category || '-')}</td>
+        <td>${escapeHtml(item.reason || '-')}</td>
+        <td>${escapeHtml(item.source || '-')}</td>
+      </tr>
+    `).join('');
+  }
+
+  async function loadLlmPicks() {
+    const body = document.getElementById('llmTableBody');
+    const meta = document.getElementById('llmMeta');
+    body.innerHTML = '<tr><td colspan="5" class="empty-cell">Loading LLM decisions…</td></tr>';
+    try {
+      const response = await fetch('/api/llm-picks');
+      const data = await response.json();
+      llmItems = data.items || [];
+      meta.textContent = `${data.kept || 0} kept · ${data.dropped || 0} dropped${data.evaluated_at ? ' · ' + data.evaluated_at : ''}`;
+      if (!llmItems.length) {
+        body.innerHTML = '<tr><td colspan="5" class="empty-cell">No LLM run yet. Click Refresh live to evaluate.</td></tr>';
+        return;
+      }
+      renderLlmPicks(llmItems);
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="5" class="empty-cell">Could not load LLM picks: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
   async function loadLive(refresh = false, silent = false) {
     const feed = document.getElementById('liveFeed');
     if (!silent) {
-      feed.innerHTML = '<div class="empty"><span class="spinner"></span> Loading today\'s live news…</div>';
+      feed.innerHTML = '<div class="empty"><span class="spinner"></span> Fetching today\'s news and keeping only Contract / Project Awarded…</div>';
     }
     try {
       const response = await fetch(`/api/live${refresh ? '?refresh=1' : ''}`);
@@ -1013,6 +1166,14 @@
   document.getElementById('refreshLiveBtn').addEventListener('click', () => loadLive(true));
   document.getElementById('refreshLogBtn').addEventListener('click', () => loadLog());
   document.getElementById('refreshNewsLogBtn').addEventListener('click', () => loadNewsLog());
+  document.getElementById('refreshExtractedBtn').addEventListener('click', () => loadExtracted());
+  document.getElementById('refreshLlmBtn').addEventListener('click', () => loadLlmPicks());
+  document.querySelectorAll('[data-llm-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      llmFilter = btn.dataset.llmFilter;
+      renderLlmPicks(llmItems);
+    });
+  });
 
   async function refreshConnectState() {
     const pill = document.getElementById('connectStatusPill');
@@ -1026,6 +1187,7 @@
         pill.textContent = 'Bot not running';
         pill.className = 'status-pill failed';
         groupPanel.style.display = 'none';
+        window._waGroupsLoaded = false;
         panel.innerHTML = `
           <p>Start the WhatsApp bot first. In a terminal, in the project folder, run:</p>
           <pre style="background:var(--surface-2);padding:12px 14px;border-radius:8px;overflow-x:auto;font-size:13px">node whatsapp_selfhosted.js</pre>
@@ -1038,10 +1200,14 @@
         pill.className = 'status-pill sent';
         panel.innerHTML = '<p>✓ WhatsApp is connected and ready to post.</p>';
         groupPanel.style.display = '';
-        loadGroups();
+        if (!window._waGroupsLoaded) {
+          window._waGroupsLoaded = true;
+          loadGroups();
+        }
         return;
       }
 
+      window._waGroupsLoaded = false;
       pill.textContent = 'Waiting for scan';
       pill.className = 'status-pill waiting';
       groupPanel.style.display = 'none';
@@ -1090,7 +1256,10 @@
     }
   }
 
-  document.getElementById('refreshConnectBtn').addEventListener('click', () => refreshConnectState());
+  document.getElementById('refreshConnectBtn').addEventListener('click', () => {
+    window._waGroupsLoaded = false;
+    refreshConnectState();
+  });
   document.getElementById('groupList').addEventListener('click', async (event) => {
     const btn = event.target.closest('[data-group-id]');
     if (!btn) return;
@@ -1142,6 +1311,8 @@
     postNext(btn.dataset.id);
   });
 
+  if (location.hash === '#extracted') switchTab('extracted');
+  if (location.hash === '#llmpicks') switchTab('llmpicks');
   if (location.hash === '#live') switchTab('live');
   if (location.hash === '#newslog') switchTab('newslog');
   if (location.hash === '#log') switchTab('log');
