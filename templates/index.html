@@ -542,7 +542,6 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
       </div>
       <h3>No search run yet</h3>
-      <p><strong>Fresh News Mode:</strong> Leave dates empty to automatically search <strong>yesterday + today</strong> (freshest available news). Google News RSS has 6-24 hour delay, so "yesterday's news" is actually today's fresh news! Select specific dates for historical searches.</p>
     </div>
   {% else %}
     {% if results|length > 0 %}
@@ -1076,7 +1075,7 @@
       const response = await fetch('/api/extracted');
       const data = await response.json();
       const articles = data.articles || [];
-      meta.textContent = `${articles.length} headline(s) extracted${data.fetched_at ? ' · ' + data.fetched_at : ''}. LLM has not filtered this list yet.`;
+      meta.textContent = `${articles.length} headline(s) extracted${data.fetched_at ? ' · ' + data.fetched_at : ''}`;
       if (!articles.length) {
         body.innerHTML = '<tr><td colspan="4" class="empty-cell">Nothing extracted yet. Click Refresh live to fetch.</td></tr>';
         return;
