@@ -112,14 +112,13 @@ client.on('ready', () => {
     cachedGroups = null;
 });
 
-// Handle disconnection
+// Handle disconnection. Reconnect regardless of reason - LOGOUT, max QR
+// retries exhausted, or anything else - so an unwatched bot recovers on
+// its own instead of sitting dead until someone notices and restarts it.
 client.on('disconnected', (reason) => {
-    console.log('WhatsApp disconnected:', reason);
+    console.log('WhatsApp disconnected:', reason, '- reconnecting...');
     latestQr = null;
-    if (reason === 'LOGOUT') {
-        console.log('Link again from the Connect WhatsApp tab (new QR in a few seconds).');
-        scheduleReinit('logout');
-    }
+    scheduleReinit(reason || 'disconnected');
 });
 
 // API endpoint: check if bot is ready
