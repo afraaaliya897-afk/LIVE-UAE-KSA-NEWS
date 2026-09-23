@@ -53,7 +53,7 @@ from store import (
 app = Flask(__name__)
 
 WHATSAPP_CONFIG_FILE = "selfhosted_config.json"
-POLL_INTERVAL_SECONDS = 10 * 60  # how often the poller checks for fresh news
+POLL_INTERVAL_SECONDS = 5 * 60  # how often the poller checks for fresh news
 SEND_PACE_SECONDS = (15, 20)  # gap between consecutive auto-sends when several land at once
 
 _poll_lock = threading.Lock()
