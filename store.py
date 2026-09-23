@@ -127,6 +127,32 @@ def merge_into_live(new_articles):
     return {**data, "stale": False}, newly_added
 
 
+def add_manual_approval_to_live(article):
+    """Insert one manually-approved article into today's live list, without
+    touching the rest (unlike merge_into_live, which replaces the whole
+    list each poll cycle - that would wipe out everything else if reused
+    for a single manual add). Returns True if added, False if it was
+    already there or a duplicate of something already in Live today."""
+    day = today_str()
+    with _lock:
+        data = _read_json(LIVE_FILE, {"day": "", "articles": []})
+        articles = data.get("articles", []) if data.get("day") == day else []
+        title = article.get("title", "")
+        if any(a.get("id") == article.get("id") for a in articles):
+            return False
+        if _is_duplicate_title(title, [a.get("title", "") for a in articles]):
+            return False
+        article = {
+            **article,
+            "llm_approved": True,
+            "manually_approved": True,
+            "discovered_at": now_iso(),
+        }
+        articles.append(article)
+        _write_json(LIVE_FILE, {"day": day, "fetched_at": now_iso(), "articles": articles})
+    return True
+
+
 def load_queue():
     with _lock:
         data = _read_json(QUEUE_FILE, {"last_sent_at": None, "items": []})

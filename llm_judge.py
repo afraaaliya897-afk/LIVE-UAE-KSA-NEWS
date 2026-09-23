@@ -9,12 +9,48 @@
 import json
 import os
 import re
+import threading
 from datetime import datetime
 
 import requests
 
 AWARD_CATEGORIES = ("Contract Awarded", "Project Awarded")
 BATCH_SIZE = 15
+
+# Once a specific headline (by id) has been judged, that verdict is final -
+# it is never re-asked of the LLM again, so the same story can't flip-flop
+# between "kept" and "dropped" across later poll cycles just because an
+# LLM call near a borderline case landed slightly differently. A manual
+# "Approve to Live" override also writes here (see override_verdict), so a
+# human's decision sticks exactly the same way the LLM's own does.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VERDICT_CACHE_FILE = os.path.join(BASE_DIR, "llm_verdict_cache.json")
+_cache_lock = threading.Lock()
+
+
+def _load_verdict_cache():
+    if not os.path.exists(VERDICT_CACHE_FILE):
+        return {}
+    try:
+        with open(VERDICT_CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_verdict_cache(cache):
+    with open(VERDICT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+def override_verdict(article_id, keep, category, reason):
+    """Record a manual human decision as a permanent verdict, exactly like
+    an LLM verdict - used by the "Approve to Live" override so it sticks
+    across future poll cycles instead of being silently dropped again."""
+    with _cache_lock:
+        cache = _load_verdict_cache()
+        cache[article_id] = {"keep": bool(keep), "category": category if keep else None, "reason": reason}
+        _save_verdict_cache(cache)
 _AWARD_CUE = re.compile(
     r"\b(awarded|award|awards|wins|won|secures|secured|signed|signs|inks|inked|"
     r"appointed|appoints|bags|bagged|clinches|clinched|contract|tender|epc|"
@@ -34,8 +70,8 @@ If the headline is really about sales, prices, occupancy, the economy, oil, flig
 
 KEEP only when ALL are true:
 1) The work is physical construction, infrastructure, EPC, buildings, housing delivery, or real-estate development in the UAE or Saudi Arabia.
-2) The headline reports a completed award: awarded, won, secured, signed, inked, or a contractor/consultant was appointed.
-3) A named project, package, or scope is being given to a builder, developer, consultant, or government client.
+2) The headline reports a completed award: awarded, won, secured, signed, inked, a contractor/consultant was appointed, OR a ruler/government body officially approved a specific named project (the approval itself is the award, even before a contractor is named).
+3) A named project, package, or scope is being given to a builder, developer, consultant, or government client - or, for a ruler/government approval, a specific named project is what got approved (not a general policy or plan).
 
 REJECT, even if the headline mentions construction, projects, homes, or a large sum:
 - homes sold, units sold out, sales, bookings, occupancy, hotel performance
@@ -47,9 +83,11 @@ REJECT, even if the headline mentions construction, projects, homes, or a large 
 Examples:
 KEEP "Besix awarded AED 500m contract to build Dubai metro station" -> Contract Awarded
 KEEP "NEOM appoints contractor for staff housing project" -> Project Awarded
+KEEP "Sharjah ruler approves Al Freish Lake project near Al Marsh Square" -> Project Awarded (a ruler's approval of a specific named project is itself the award)
 REJECT "Sharjah waterfront sells all homes before construction begins" -> sales, not an award
 REJECT "Saudi economy projected to grow" -> not construction
 REJECT "Developer exploring Riyadh tower" -> no award yet
+REJECT "Fischer wins supply deal for Jeddah Tower" -> Fischer supplies materials/hardware, it is not the builder/contractor being awarded the construction scope; a materials or product supply deal is not a construction contract even when it names a real project
 
 Return JSON only:
 {"results":[{"i":0,"keep":true,"category":"Contract Awarded"|"Project Awarded"|null,"reason":"short reason"}]}
@@ -150,24 +188,28 @@ def judge_award_articles(articles):
     """Judge headlines. Returns (kept_articles, evaluations).
 
     evaluations includes both kept and dropped rows so the UI can show
-    how the LLM selected.
+    how the LLM selected. Any article whose id already has a cached verdict
+    (from a prior LLM judgment or a manual override) reuses that verdict
+    without calling the LLM again - see VERDICT_CACHE_FILE above.
     """
     now = datetime.now().isoformat(timespec="seconds")
 
     if not articles:
         return [], []
 
+    import hashlib
+
+    def ensure_id(article):
+        if article.get("id"):
+            return article
+        aid = hashlib.md5(f"{article.get('title', '')}{article.get('link', '')}".encode()).hexdigest()[:16]
+        return {**article, "id": aid}
+
     def row(article, keep, category, reason):
-        title = article.get("title", "")
-        link = article.get("link", "")
-        aid = article.get("id")
-        if not aid:
-            import hashlib
-            aid = hashlib.md5(f"{title}{link}".encode()).hexdigest()[:16]
         return {
-            "id": aid,
-            "title": title,
-            "link": link,
+            "id": article["id"],
+            "title": article.get("title", ""),
+            "link": article.get("link", ""),
             "source": article.get("source", ""),
             "country": article.get("country", ""),
             "date": article.get("date", ""),
@@ -177,22 +219,43 @@ def judge_award_articles(articles):
             "evaluated_at": now,
         }
 
-    if not llm_configured():
-        evaluations = [
-            row(article, False, None, "LLM is not configured, so nothing is approved.")
-            for article in articles
-        ]
-        print("LLM off — nothing approved", flush=True)
-        return [], evaluations
+    articles = [ensure_id(a) for a in articles]
 
-    kept, evaluations = [], []
-    for start in range(0, len(articles), BATCH_SIZE):
-        batch = articles[start:start + BATCH_SIZE]
+    with _cache_lock:
+        cache = _load_verdict_cache()
+
+    kept, evaluations, to_judge = [], [], []
+    for article in articles:
+        cached = cache.get(article["id"])
+        if cached is None:
+            to_judge.append(article)
+            continue
+        keep, category, reason = cached["keep"], cached["category"], cached["reason"]
+        evaluations.append(row(article, keep, category, reason))
+        if keep:
+            kept.append({**article, "cat": category, "llm_approved": True})
+
+    if not to_judge:
+        print(f"LLM award filter: {len(kept)}/{len(articles)} kept (all served from cache)", flush=True)
+        return kept, evaluations
+
+    if not llm_configured():
+        for article in to_judge:
+            evaluations.append(row(article, False, None, "LLM is not configured, so nothing is approved."))
+        print("LLM off — nothing approved", flush=True)
+        return kept, evaluations
+
+    new_verdicts = {}
+    for start in range(0, len(to_judge), BATCH_SIZE):
+        batch = to_judge[start:start + BATCH_SIZE]
         try:
             results = _judge_batch(batch)
         except Exception as exc:
             print(f"LLM judge failed, dropping this batch: {exc}", flush=True)
             for article in batch:
+                # Not cached: an API/network error is transient, not a
+                # content judgment - retry it fresh next cycle instead of
+                # permanently locking in a rejection caused by an outage.
                 evaluations.append(row(article, False, None, f"LLM error: {exc}"))
             continue
 
@@ -221,6 +284,13 @@ def judge_award_articles(articles):
             evaluations.append(row(article, keep, category if keep else None, reason))
             if keep:
                 kept.append({**article, "cat": category, "llm_approved": True})
+            new_verdicts[article["id"]] = {"keep": keep, "category": category if keep else None, "reason": reason}
+
+    if new_verdicts:
+        with _cache_lock:
+            cache = _load_verdict_cache()
+            cache.update(new_verdicts)
+            _save_verdict_cache(cache)
 
     print(f"LLM award filter kept {len(kept)}/{len(articles)}", flush=True)
     return kept, evaluations

@@ -736,10 +736,11 @@
               <th>Category</th>
               <th>Why</th>
               <th>Source</th>
+              <th>Override</th>
             </tr>
           </thead>
           <tbody id="llmTableBody">
-            <tr><td colspan="5" class="empty-cell">Open this tab after a live fetch.</td></tr>
+            <tr><td colspan="6" class="empty-cell">Open this tab after a live fetch.</td></tr>
           </tbody>
         </table>
       </div>
@@ -1103,7 +1104,7 @@
       return true;
     });
     if (!filtered.length) {
-      body.innerHTML = '<tr><td colspan="5" class="empty-cell">No rows for this filter.</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="empty-cell">No rows for this filter.</td></tr>';
       return;
     }
     body.innerHTML = filtered.map(item => `
@@ -1113,6 +1114,14 @@
         <td>${escapeHtml(item.category || '-')}</td>
         <td>${escapeHtml(item.reason || '-')}</td>
         <td>${escapeHtml(item.source || '-')}</td>
+        <td>
+          ${item.keep ? '-' : `
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button type="button" class="mini-post" style="background:#0f766e" data-approve-id="${escapeHtml(item.id)}" data-approve-category="Project Awarded">Approve: Project</button>
+              <button type="button" class="mini-post" style="background:#b5551e" data-approve-id="${escapeHtml(item.id)}" data-approve-category="Contract Awarded">Approve: Contract</button>
+            </div>
+          `}
+        </td>
       </tr>
     `).join('');
   }
@@ -1120,21 +1129,46 @@
   async function loadLlmPicks() {
     const body = document.getElementById('llmTableBody');
     const meta = document.getElementById('llmMeta');
-    body.innerHTML = '<tr><td colspan="5" class="empty-cell">Loading LLM decisions…</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty-cell">Loading LLM decisions…</td></tr>';
     try {
       const response = await fetch('/api/llm-picks');
       const data = await response.json();
       llmItems = data.items || [];
       meta.textContent = `${data.kept || 0} kept · ${data.dropped || 0} dropped${data.evaluated_at ? ' · ' + data.evaluated_at : ''}`;
       if (!llmItems.length) {
-        body.innerHTML = '<tr><td colspan="5" class="empty-cell">No LLM run yet. Click Refresh live to evaluate.</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="empty-cell">No LLM run yet. Click Refresh live to evaluate.</td></tr>';
         return;
       }
       renderLlmPicks(llmItems);
     } catch (error) {
-      body.innerHTML = `<tr><td colspan="5" class="empty-cell">Could not load LLM picks: ${escapeHtml(error.message)}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="6" class="empty-cell">Could not load LLM picks: ${escapeHtml(error.message)}</td></tr>`;
     }
   }
+
+  document.getElementById('llmTableBody').addEventListener('click', async (event) => {
+    const btn = event.target.closest('[data-approve-id]');
+    if (!btn) return;
+    const category = btn.dataset.approveCategory;
+    const confirmed = confirm(`Move this to Live as "${category}"? This overrides the LLM's rejection - it'll be queued for auto-send like any other approved story, and this same headline won't be dropped again on future cycles.`);
+    if (!confirmed) return;
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = 'Approving…';
+    try {
+      const response = await fetch('/api/llm-picks/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: btn.dataset.approveId, category })
+      });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Failed to approve');
+      btn.closest('td').innerHTML = 'Approved ✓';
+    } catch (error) {
+      alert('Failed to approve: ' + error.message);
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  });
 
   async function loadLive(refresh = false, silent = false) {
     const feed = document.getElementById('liveFeed');

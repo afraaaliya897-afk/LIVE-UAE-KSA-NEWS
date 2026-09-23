@@ -25,9 +25,10 @@ from pipeline import (
     load_from_cache,
     save_to_cache,
 )
-from llm_judge import AWARD_CATEGORIES, judge_award_articles
+from llm_judge import AWARD_CATEGORIES, judge_award_articles, override_verdict
 from store import (
     BUSINESS_TZ,
+    add_manual_approval_to_live,
     article_id,
     enqueue_articles,
     format_whatsapp_message,
@@ -105,6 +106,7 @@ def run_poll_cycle():
     finalized = finalize_articles(raw, date_from, date_to)
     extracted = [item for item in finalized if is_fresh(item.get("published_at", ""))]
     save_extracted(extracted)
+    log_discovered(extracted)  # permanent record of every headline extracted today, kept or dropped
 
     to_judge = [{**item, "cat": item.get("category")} for item in extracted]
     kept, evaluations = judge_award_articles(to_judge)
@@ -128,7 +130,6 @@ def run_poll_cycle():
 
     live, newly_added = merge_into_live(articles)
     if newly_added:
-        log_discovered(newly_added)
         enqueue_articles(newly_added)
     return live, newly_added
 
@@ -196,6 +197,23 @@ def bot_is_ready():
         return False
 
 
+def resolve_direct_link(bot_api_url, link):
+    """Ask the Node bot (which already has a live Puppeteer browser open
+    for WhatsApp) to resolve a Google News redirect to its real destination
+    - only called once, right before an actual send. Falls back to the
+    original link on any failure, so a slow/broken resolve never blocks
+    a send."""
+    if not link or "news.google.com" not in link:
+        return link
+    try:
+        response = requests.post(f"{bot_api_url}/resolve-link", json={"url": link}, timeout=10)
+        response.raise_for_status()
+        return response.json().get("url") or link
+    except Exception as exc:
+        print(f"Link resolve failed, using original link: {exc}", flush=True)
+        return link
+
+
 def send_article_to_group(article):
     group_id = ""
     aid = article.get("id") or article_id(article.get("title", ""), article.get("link", ""))
@@ -237,6 +255,7 @@ def send_article_to_group(article):
         if any(titles_are_same_story(article.get("title", ""), sent_title) for sent_title in sent_titles):
             return None, "already_sent"
 
+        article = {**article, "link": resolve_direct_link(bot_api_url, article.get("link", ""))}
         message = format_whatsapp_message(article)
         response = requests.post(
             f"{bot_api_url}/send",
@@ -394,6 +413,41 @@ def api_extracted():
 def api_llm_picks():
     data = load_llm_picks()
     return jsonify({"success": True, **data})
+
+
+@app.route("/api/llm-picks/approve", methods=["POST"])
+def api_approve_to_live():
+    """Manual override for a story the LLM dropped: pushes it straight into
+    Live under the chosen category, queues it for auto-send like anything
+    else, and records the decision as a permanent verdict (see
+    llm_judge.override_verdict) so a later poll cycle re-extracting the
+    same headline doesn't quietly drop it again."""
+    data = request.get_json(silent=True) or {}
+    article_id_req = data.get("id")
+    category = data.get("category")
+    if not article_id_req or category not in AWARD_CATEGORIES:
+        return jsonify({
+            "success": False,
+            "error": "id and a valid category (Contract Awarded or Project Awarded) are required",
+        }), 400
+
+    extracted = load_extracted().get("articles", [])
+    article = next((a for a in extracted if a.get("id") == article_id_req), None)
+    if article is None:
+        return jsonify({"success": False, "error": "Article not found in today's extracted list"}), 404
+
+    article = {**article, "category": category}
+    override_verdict(article_id_req, True, category, "Manually approved by user override")
+    added = add_manual_approval_to_live(article)
+    if added:
+        enqueue_articles([article])
+
+    return jsonify({
+        "success": True,
+        "added": added,
+        "message": "Approved to Live." if added else "Already in today's Live list.",
+        "queue": queue_payload(),
+    })
 
 
 @app.route("/api/log")

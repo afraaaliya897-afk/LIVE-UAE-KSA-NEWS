@@ -223,6 +223,41 @@ app.post('/send', async (req, res) => {
     }
 });
 
+// API endpoint: resolve a Google News redirect link to its real destination.
+// Only ever called once per message, right before it's actually sent - not
+// for every extracted candidate. Google's redirect is client-side JS, so a
+// plain HTTP request can't follow it; this reuses the browser this bot
+// already has open for WhatsApp itself rather than adding a second one.
+// Any failure (timeout, page error, missing browser handle) falls back to
+// the original Google link so a slow/broken resolve never blocks a send.
+app.post('/resolve-link', async (req, res) => {
+    const { url } = req.body;
+    if (!url) {
+        return res.status(400).json({ error: 'url is required' });
+    }
+    if (!url.includes('news.google.com') || !client.pupBrowser) {
+        return res.json({ url });
+    }
+    let page;
+    try {
+        page = await client.pupBrowser.newPage();
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
+        await page.waitForFunction(
+            () => !location.href.includes('news.google.com'),
+            { timeout: 6000 }
+        ).catch(() => {});
+        const finalUrl = page.url();
+        res.json({ url: finalUrl.includes('news.google.com') ? url : finalUrl });
+    } catch (err) {
+        console.error('Link resolve failed, using original link:', err.message);
+        res.json({ url });
+    } finally {
+        if (page) {
+            try { await page.close(); } catch (_) {}
+        }
+    }
+});
+
 // API endpoint: fully unlink the current number so a different one can be
 // scanned in. Deliberately skips client.logout() - calling it can itself
 // fire the 'disconnected' event and race with this handler's own reconnect,
