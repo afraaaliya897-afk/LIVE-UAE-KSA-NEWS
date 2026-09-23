@@ -585,4 +585,4 @@ if __name__ == "__main__":
     start_background_loops()
     # Run with debug=False to prevent auto-reload creating multiple processes
     # Use use_reloader=False to ensure only one process
-    app.run(debug=False, port=5050, threaded=True, use_reloader=False)
+    app.run(host='0.0.0.0', debug=False, port=5050, threaded=True, use_reloader=False)
