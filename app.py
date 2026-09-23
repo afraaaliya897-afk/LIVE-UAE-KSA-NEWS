@@ -428,7 +428,7 @@ def api_approve_to_live():
     if not article_id_req or category not in AWARD_CATEGORIES:
         return jsonify({
             "success": False,
-            "error": "id and a valid category (Contract Awarded or Project Awarded) are required",
+            "error": f"id and a valid category ({', '.join(AWARD_CATEGORIES)}) are required",
         }), 400
 
     extracted = load_extracted().get("articles", [])

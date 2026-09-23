@@ -14,7 +14,7 @@ from datetime import datetime
 
 import requests
 
-AWARD_CATEGORIES = ("Contract Awarded", "Project Awarded")
+AWARD_CATEGORIES = ("Contract Awarded", "Project Awarded", "Project Completed")
 BATCH_SIZE = 15
 
 # Once a specific headline (by id) has been judged, that verdict is final -
@@ -51,10 +51,14 @@ def override_verdict(article_id, keep, category, reason):
         cache = _load_verdict_cache()
         cache[article_id] = {"keep": bool(keep), "category": category if keep else None, "reason": reason}
         _save_verdict_cache(cache)
+
+
 _AWARD_CUE = re.compile(
     r"\b(awarded|award|awards|wins|won|secures|secured|signed|signs|inks|inked|"
     r"appointed|appoints|bags|bagged|clinches|clinched|contract|tender|epc|"
-    r"contractor|selected|named)\b",
+    r"contractor|selected|named|"
+    r"completes|completed|completion|handover|handed over|delivered|"
+    r"finishes|finished|inaugurated|inaugurates|opens|opened)\b",
     re.IGNORECASE,
 )
 
@@ -70,12 +74,14 @@ If the headline is really about sales, prices, occupancy, the economy, oil, flig
 
 KEEP only when ALL are true:
 1) The work is physical construction, infrastructure, EPC, buildings, housing delivery, or real-estate development in the UAE or Saudi Arabia.
-2) The headline reports a completed award: awarded, won, secured, signed, inked, a contractor/consultant was appointed, OR a ruler/government body officially approved a specific named project (the approval itself is the award, even before a contractor is named).
-3) A named project, package, or scope is being given to a builder, developer, consultant, or government client - or, for a ruler/government approval, a specific named project is what got approved (not a general policy or plan).
+2) The headline reports ONE of:
+   a) a completed award: awarded, won, secured, signed, inked, a contractor/consultant was appointed, OR a ruler/government body officially approved a specific named project (the approval itself is the award, even before a contractor is named); OR
+   b) a specific, named project physically finishing: completed, handed over, delivered, opened, inaugurated - a single identifiable building/project reaching completion, not a market-wide count of many projects.
+3) A named project, package, or scope is identifiable - given to a builder, developer, consultant, or government client (for an award), or the specific project that finished (for a completion). A citywide/sector-wide statistic naming no single project is NOT a named project, even with a specific number attached.
 
 REJECT, even if the headline mentions construction, projects, homes, or a large sum:
 - homes sold, units sold out, sales, bookings, occupancy, hotel performance
-- market growth, forecasts, statistics, permit counts, "sector grows"
+- market growth, forecasts, statistics, permit counts, "sector grows", aggregate counts of many completed projects (e.g. "X billion in completed projects this year")
 - "plans", "eyes", "exploring", "in talks", "mulls", "proposed" with no award
 - oil, energy trading, flights, telecom, AI, software, IT, finance, defense, sports
 - CSR, accidents, appointments of CEOs that are not a construction contract
@@ -84,15 +90,18 @@ Examples:
 KEEP "Besix awarded AED 500m contract to build Dubai metro station" -> Contract Awarded
 KEEP "NEOM appoints contractor for staff housing project" -> Project Awarded
 KEEP "Sharjah ruler approves Al Freish Lake project near Al Marsh Square" -> Project Awarded (a ruler's approval of a specific named project is itself the award)
+KEEP "Aldar completes Yas Bay residential tower, handover begins next month" -> Project Completed (one specific, named project physically finished)
 REJECT "Sharjah waterfront sells all homes before construction begins" -> sales, not an award
 REJECT "Saudi economy projected to grow" -> not construction
 REJECT "Developer exploring Riyadh tower" -> no award yet
 REJECT "Fischer wins supply deal for Jeddah Tower" -> Fischer supplies materials/hardware, it is not the builder/contractor being awarded the construction scope; a materials or product supply deal is not a construction contract even when it names a real project
+REJECT "Dubai records $29.3bln in completed real estate projects in H1" -> an aggregate citywide statistic covering many unnamed projects, not one specific named project's completion
 
 Return JSON only:
-{"results":[{"i":0,"keep":true,"category":"Contract Awarded"|"Project Awarded"|null,"reason":"short reason"}]}
+{"results":[{"i":0,"keep":true,"category":"Contract Awarded"|"Project Awarded"|"Project Completed"|null,"reason":"short reason"}]}
 Contract Awarded = a contract, tender, or EPC deal was awarded or signed.
 Project Awarded = a project was awarded or a contractor was appointed to build it.
+Project Completed = one specific, named project physically finished/handed over (never an aggregate market-wide statistic).
 If keep is false, category must be null. If you are unsure, keep must be false.
 """
 
