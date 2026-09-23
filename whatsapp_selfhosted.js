@@ -44,8 +44,17 @@ function scheduleReinit(reason) {
     isReady = false;
     cachedGroups = null;
     console.log('WhatsApp page broke (' + reason + '). Reconnecting in 3s...');
-    reinitTimer = setTimeout(() => {
+    reinitTimer = setTimeout(async () => {
         reinitTimer = null;
+        // Tear down the old Puppeteer browser first - without this, its
+        // still-open Chromium process keeps the session folder's files
+        // locked, so the new initialize() below fails with EBUSY / "browser
+        // already running" in a loop that never reaches a fresh QR code.
+        try {
+            await client.destroy();
+        } catch (err) {
+            console.error('destroy() before reinit failed (continuing anyway):', err.message);
+        }
         client.initialize().catch((err) => {
             console.error('Re-init failed:', err.message);
         });
