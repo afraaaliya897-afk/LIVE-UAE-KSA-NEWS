@@ -38,12 +38,21 @@ let isReady = false;
 let latestQr = null; // data URL of the current QR image, or null when not needed
 let cachedGroups = null;
 let reinitTimer = null;
+let reinitDelayMs = 3000;
+const REINIT_DELAY_MAX_MS = 5 * 60 * 1000; // cap at 5 minutes between attempts
 
+// Doubles after every failed attempt, reset to 3s once 'ready' fires again.
+// A fixed 3s retry, hit repeatedly during a genuine outage (e.g. the EBUSY
+// loop this was written to fix), hammers WhatsApp's servers with rapid
+// repeated device-pairing/session-init attempts - exactly the kind of
+// pattern their abuse detection flags an account for, separate from
+// anything about the message-sending itself.
 function scheduleReinit(reason) {
     if (reinitTimer) return;
     isReady = false;
     cachedGroups = null;
-    console.log('WhatsApp page broke (' + reason + '). Reconnecting in 3s...');
+    const delay = reinitDelayMs;
+    console.log(`WhatsApp page broke (${reason}). Reconnecting in ${Math.round(delay / 1000)}s...`);
     reinitTimer = setTimeout(async () => {
         reinitTimer = null;
         // Tear down the old Puppeteer browser first - without this, its
@@ -55,10 +64,11 @@ function scheduleReinit(reason) {
         } catch (err) {
             console.error('destroy() before reinit failed (continuing anyway):', err.message);
         }
+        reinitDelayMs = Math.min(reinitDelayMs * 2, REINIT_DELAY_MAX_MS);
         client.initialize().catch((err) => {
             console.error('Re-init failed:', err.message);
         });
-    }, 3000);
+    }, delay);
 }
 
 // Initialize WhatsApp client with local authentication
@@ -119,6 +129,7 @@ client.on('ready', () => {
     isReady = true;
     latestQr = null;
     cachedGroups = null;
+    reinitDelayMs = 3000; // healthy again - drop back to the fast retry for next time
 });
 
 // Handle disconnection. Reconnect regardless of reason - LOGOUT, max QR
