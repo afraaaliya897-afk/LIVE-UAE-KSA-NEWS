@@ -32,15 +32,23 @@ def fetch_feed(url):
 
 
 async def fetch_feed_async(session, url):
-    """Async version of fetch_feed for parallel requests."""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as response:  # Reduced from 20s to 12s
-            content = await response.read()
-            parsed = feedparser.parse(content)
-            return parsed.entries
-    except Exception as e:
-        print(f"Error fetching {url}: {e}")
-        return []
+    """Async version of fetch_feed for parallel requests.
+
+    One retry on failure - a single transient DNS/connection hiccup
+    (observed in production as 'getaddrinfo failed') would otherwise
+    silently drop that entire source's results for the whole poll cycle."""
+    for attempt in range(2):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as response:  # Reduced from 20s to 12s
+                content = await response.read()
+                parsed = feedparser.parse(content)
+                return parsed.entries
+        except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(2)
+                continue
+            print(f"Error fetching {url}: {e}")
+            return []
 
 
 def build_search_url(publisher_domain, country, keyword=None, date_from=None, date_to=None):
@@ -294,15 +302,20 @@ def write_html_report(items, path="report.html"):
 
 
 async def fetch_all_feeds_parallel(keyword=None, date_from=None, date_to=None):
-    """Fetch all feeds in parallel using async requests."""
+    """Fetch all feeds in parallel using async requests.
+
+    Each fetch is wrapped in asyncio.create_task so it starts running the
+    moment it's created - awaiting a bare coroutine (the previous approach)
+    runs it to completion before moving to the next one, i.e. sequentially,
+    despite the surrounding async/await syntax looking concurrent."""
     tasks = []
-    
+
     async with aiohttp.ClientSession() as session:
         for publisher in TRUSTED_PUBLISHERS:
             for country in ["UAE", "Saudi Arabia"]:
                 url = build_search_url(publisher, country, keyword, date_from, date_to)
-                tasks.append((publisher, country, fetch_feed_async(session, url)))
-        
+                tasks.append((publisher, country, asyncio.create_task(fetch_feed_async(session, url))))
+
         results = []
         for publisher, country, task in tasks:
             articles = await task
