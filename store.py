@@ -243,12 +243,13 @@ def enqueue_articles(articles):
         queued_ids = {item.get("id") for item in queue.get("items", [])}
         queued_titles = [item.get("title", "") for item in queue.get("items", [])]
         
-        # Also check against recent log entries to avoid re-queueing recently sent items
+        # Only check against articles actually SENT before - not the News Log,
+        # which logs every headline the moment it's extracted, before judging.
+        # Matching against that would flag every newly-approved article as a
+        # "duplicate" of its own News Log entry and silently drop it here.
         log = _read_json(LOG_FILE, [])
-        recent_titles = [entry.get("title", "") for entry in log]
-        news_log = _read_json(NEWS_LOG_FILE, [])
-        recent_titles.extend(entry.get("title", "") for entry in news_log)
-        
+        recent_titles = [entry.get("title", "") for entry in log if entry.get("status") == "sent"]
+
         added = []
         for article in articles:
             # STRICT: Only queue news still inside the fresh window
